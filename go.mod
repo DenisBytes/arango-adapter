@@ -2,7 +2,7 @@ module github.com/DenisBytes/arango-adapter
 
 go 1.23.2
 
-require github.com/casbin/casbin/v2 v2.103.0
+require github.com/casbin/casbin/v2 v2.123.0
 
 require (
 	github.com/arangodb/go-velocypack v0.0.0-20200318135517-5af53c29c67e // indirect

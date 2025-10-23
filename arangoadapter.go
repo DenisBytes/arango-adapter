@@ -4,10 +4,12 @@ package arangoadapter
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 
 	"github.com/arangodb/go-driver/v2/arangodb"
+	"github.com/casbin/casbin/v2"
 	"github.com/casbin/casbin/v2/model"
 	"github.com/casbin/casbin/v2/persist"
 )
@@ -56,6 +58,7 @@ type Adapter struct {
 	databaseName   string
 	collectionName string
 	isFiltered     bool
+	transaction    arangodb.Transaction // Active transaction, if any
 	transactionMu  *sync.Mutex
 	muInitialize   sync.Once
 }
@@ -153,13 +156,13 @@ func (a *Adapter) ensureCollectionExists() error {
 
 // loadPolicyLine converts a database rule into a Casbin policy line.
 func loadPolicyLine(line CasbinRule, model model.Model) error {
-	var p []string
-
 	if line.Ptype == "" {
 		return nil
 	}
 
-	p = append(p, line.V0, line.V1, line.V2, line.V3, line.V4, line.V5)
+	// Build the policy array
+	var p []string
+	p = append(p, line.Ptype, line.V0, line.V1, line.V2, line.V3, line.V4, line.V5)
 
 	// Trim trailing empty fields since Casbin doesn't need them
 	index := len(p) - 1
@@ -168,12 +171,8 @@ func loadPolicyLine(line CasbinRule, model model.Model) error {
 	}
 	p = p[:index+1]
 
-	// Figure out which section this rule belongs to ("p" or "g")
-	section := line.Ptype[:1]
-
-	// Let the model handle adding this policy
-	err := persist.LoadPolicyArray(p, model[section][line.Ptype])
-	return err
+	// Load into model
+	return persist.LoadPolicyArray(p, model)
 }
 
 // LoadPolicy loads all policies from the database into the Casbin model.
@@ -626,4 +625,158 @@ func (a *Adapter) Close() error {
 	// Connection pooling is managed automatically
 	// This method is here for interface compliance and future needs
 	return nil
+}
+
+// Copy creates a shallow copy of the adapter.
+// Useful for transaction handling where we need separate adapter instances.
+func (a *Adapter) Copy() *Adapter {
+	return &Adapter{
+		client:         a.client,
+		db:             a.db,
+		collection:     a.collection,
+		databaseName:   a.databaseName,
+		collectionName: a.collectionName,
+		isFiltered:     a.isFiltered,
+		transactionMu:  a.transactionMu,
+	}
+}
+
+// Transaction executes a function within a database transaction.
+// This is the old-style transaction interface for backward compatibility.
+func (a *Adapter) Transaction(e casbin.IEnforcer, fc func(casbin.IEnforcer) error) error {
+	// Ensure transaction mutex is initialized
+	if a.transactionMu == nil {
+		a.muInitialize.Do(func() {
+			if a.transactionMu == nil {
+				a.transactionMu = &sync.Mutex{}
+			}
+		})
+	}
+
+	// Lock to ensure thread safety
+	a.transactionMu.Lock()
+	defer a.transactionMu.Unlock()
+
+	// Save original adapter
+	originalAdapter := a.Copy()
+
+	ctx := context.Background()
+
+	// Start ArangoDB streaming transaction
+	tx, err := a.db.BeginTransaction(ctx, arangodb.TransactionCollections{
+		Write: []string{a.collectionName},
+	}, nil)
+	if err != nil {
+		return err
+	}
+
+	// Create transaction adapter
+	txAdapter := &Adapter{
+		client:         a.client,
+		db:             a.db,
+		collection:     a.collection,
+		databaseName:   a.databaseName,
+		collectionName: a.collectionName,
+		isFiltered:     a.isFiltered,
+		transactionMu:  a.transactionMu,
+		transaction:    tx, // Store transaction
+	}
+
+	// Temporarily set transaction adapter
+	e.SetAdapter(txAdapter)
+
+	// Execute transaction function
+	err = fc(e)
+
+	// Restore original adapter
+	e.SetAdapter(originalAdapter)
+
+	if err != nil {
+		// Rollback on error
+		if abortErr := tx.Abort(ctx, nil); abortErr != nil {
+			return abortErr
+		}
+		// Reload policy to sync in-memory model with database
+		if loadErr := e.LoadPolicy(); loadErr != nil {
+			return loadErr
+		}
+		return err
+	}
+
+	// Commit transaction
+	if commitErr := tx.Commit(ctx, nil); commitErr != nil {
+		return commitErr
+	}
+
+	return nil
+}
+
+// BeginTransaction implements TransactionalAdapter interface.
+// It starts a new database transaction and returns a TransactionContext.
+func (a *Adapter) BeginTransaction(ctx context.Context) (persist.TransactionContext, error) {
+	// Start ArangoDB streaming transaction
+	tx, err := a.db.BeginTransaction(ctx, arangodb.TransactionCollections{
+		Write: []string{a.collectionName},
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return &ArangoTransactionContext{
+		tx:             tx,
+		ctx:            ctx,
+		adapter:        a,
+		collectionName: a.collectionName,
+	}, nil
+}
+
+// ArangoTransactionContext implements persist.TransactionContext interface.
+// It provides transaction control methods and returns a transaction-aware adapter.
+type ArangoTransactionContext struct {
+	tx             arangodb.Transaction
+	ctx            context.Context
+	adapter        *Adapter
+	collectionName string
+	committed      bool
+	rolledBack     bool
+}
+
+// Commit commits the database transaction.
+func (atx *ArangoTransactionContext) Commit() error {
+	if atx.committed || atx.rolledBack {
+		return errors.New("transaction already finished")
+	}
+
+	err := atx.tx.Commit(atx.ctx, nil)
+	if err == nil {
+		atx.committed = true
+	}
+	return err
+}
+
+// Rollback rolls back the database transaction.
+func (atx *ArangoTransactionContext) Rollback() error {
+	if atx.committed || atx.rolledBack {
+		return errors.New("transaction already finished")
+	}
+
+	err := atx.tx.Abort(atx.ctx, nil)
+	if err == nil {
+		atx.rolledBack = true
+	}
+	return err
+}
+
+// GetAdapter returns an adapter that operates within this transaction.
+// All policy operations through this adapter will be part of the transaction.
+func (atx *ArangoTransactionContext) GetAdapter() persist.Adapter {
+	return &Adapter{
+		client:         atx.adapter.client,
+		db:             atx.adapter.db,
+		collection:     atx.adapter.collection,
+		databaseName:   atx.adapter.databaseName,
+		collectionName: atx.collectionName,
+		isFiltered:     atx.adapter.isFiltered,
+		transaction:    atx.tx, // Use transaction
+	}
 }
