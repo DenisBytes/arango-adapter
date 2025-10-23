@@ -617,3 +617,13 @@ func (a *Adapter) UpdateFilteredPolicies(sec string, ptype string, newPolicies [
 
 	return oldPolicies, nil
 }
+
+// Close closes the adapter and releases any resources.
+// Since the ArangoDB driver manages connections internally, this is primarily
+// for interface compliance and future extensibility.
+func (a *Adapter) Close() error {
+	// ArangoDB v2 driver doesn't expose a Close method on the client
+	// Connection pooling is managed automatically
+	// This method is here for interface compliance and future needs
+	return nil
+}
