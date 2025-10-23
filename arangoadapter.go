@@ -42,6 +42,41 @@ type Adapter struct {
 	muInitialize   sync.Once
 }
 
+// NewAdapter creates a new ArangoDB adapter using functional options.
+// It automatically creates the database and collection if they don't exist.
+//
+// Example:
+//   adapter, err := NewAdapter(
+//       WithEndpoints("http://localhost:8529"),
+//       WithAuthentication("root", "password"),
+//       WithDatabase("casbin"),
+//       WithCollection("casbin_rule"),
+//   )
+func NewAdapter(opts ...Option) (*Adapter, error) {
+	cfg := NewConfig(opts...)
+	client, err := cfg.createConnection()
+	if err != nil {
+		return nil, err
+	}
+
+	a := &Adapter{
+		client:         client,
+		databaseName:   cfg.DatabaseName,
+		collectionName: cfg.CollectionName,
+		transactionMu:  &sync.Mutex{},
+	}
+
+	if err := a.ensureDatabaseExists(); err != nil {
+		return nil, err
+	}
+
+	if err := a.ensureCollectionExists(); err != nil {
+		return nil, err
+	}
+
+	return a, nil
+}
+
 // NewAdapterFromClient creates a new ArangoDB adapter from an existing client.
 // This is useful when you already have an ArangoDB client configured.
 // It'll automatically create the database and collection if they don't exist.
