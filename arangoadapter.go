@@ -284,3 +284,24 @@ func (a *Adapter) RemovePolicyCtx(ctx context.Context, sec string, ptype string,
 	})
 	return err
 }
+
+// AddPolicies adds multiple policy rules at once.
+func (a *Adapter) AddPolicies(sec string, ptype string, rules [][]string) error {
+	var lines []CasbinRule
+	for _, rule := range rules {
+		lines = append(lines, a.savePolicyLine(ptype, rule))
+	}
+	_, err := a.collection.CreateDocuments(context.Background(), lines)
+	return err
+}
+
+// RemovePolicies removes multiple policy rules at once.
+func (a *Adapter) RemovePolicies(sec string, ptype string, rules [][]string) error {
+	for _, rule := range rules {
+		err := a.RemovePolicy(sec, ptype, rule)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
