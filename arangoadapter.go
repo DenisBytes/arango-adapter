@@ -480,8 +480,13 @@ func (a *Adapter) AddPolicies(sec string, ptype string, rules [][]string) error 
 
 // RemovePolicies removes multiple policy rules at once.
 func (a *Adapter) RemovePolicies(sec string, ptype string, rules [][]string) error {
+	return a.RemovePoliciesCtx(context.Background(), sec, ptype, rules)
+}
+
+// RemovePoliciesCtx removes multiple policy rules with context support.
+func (a *Adapter) RemovePoliciesCtx(ctx context.Context, sec string, ptype string, rules [][]string) error {
 	for _, rule := range rules {
-		err := a.RemovePolicy(sec, ptype, rule)
+		err := a.RemovePolicyCtx(ctx, sec, ptype, rule)
 		if err != nil {
 			return err
 		}
