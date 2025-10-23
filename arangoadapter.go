@@ -224,9 +224,8 @@ func (a *Adapter) LoadPolicyCtx(ctx context.Context, model model.Model) error {
 	return nil
 }
 
-// LoadFilteredPolicy loads only policies that match the filter from the database.
-// This is essential for applications with large policy sets where loading everything
-// into memory isn't practical.
+// LoadFilteredPolicy loads only policies that match the filter.
+// Useful when you have millions of policies and don't want to load them all.
 func (a *Adapter) LoadFilteredPolicy(model model.Model, filter interface{}) error {
 	return a.LoadFilteredPolicyCtx(context.Background(), model, filter)
 }
@@ -624,8 +623,7 @@ func (a *Adapter) UpdatePolicies(sec string, ptype string, oldRules, newRules []
 }
 
 // UpdateFilteredPolicies updates policies that match a filter.
-// Note: Currently this just adds the new policies without removing the old ones.
-// You might want to implement proper filtering logic here if you need it.
+// Right now it just adds the new policies - doesn't remove old ones.
 func (a *Adapter) UpdateFilteredPolicies(sec string, ptype string, newPolicies [][]string, fieldIndex int, fieldValues ...string) ([][]string, error) {
 	oldPolicies := make([][]string, 0)
 
@@ -639,13 +637,10 @@ func (a *Adapter) UpdateFilteredPolicies(sec string, ptype string, newPolicies [
 	return oldPolicies, nil
 }
 
-// Close closes the adapter and releases any resources.
-// Since the ArangoDB driver manages connections internally, this is primarily
-// for interface compliance and future extensibility.
+// Close shuts down the adapter.
+// ArangoDB handles connections internally, so this is mostly a no-op.
+// We have it to satisfy the adapter interface.
 func (a *Adapter) Close() error {
-	// ArangoDB v2 driver doesn't expose a Close method on the client
-	// Connection pooling is managed automatically
-	// This method is here for interface compliance and future needs
 	return nil
 }
 
@@ -733,8 +728,8 @@ func (a *Adapter) Transaction(e casbin.IEnforcer, fc func(casbin.IEnforcer) erro
 	return nil
 }
 
-// BeginTransaction implements TransactionalAdapter interface.
-// It starts a new database transaction and returns a TransactionContext.
+// BeginTransaction starts a new database transaction.
+// Returns a context you can use to commit or rollback.
 func (a *Adapter) BeginTransaction(ctx context.Context) (persist.TransactionContext, error) {
 	// Start ArangoDB streaming transaction
 	tx, err := a.db.BeginTransaction(ctx, arangodb.TransactionCollections{
@@ -752,8 +747,7 @@ func (a *Adapter) BeginTransaction(ctx context.Context) (persist.TransactionCont
 	}, nil
 }
 
-// ArangoTransactionContext implements persist.TransactionContext interface.
-// It provides transaction control methods and returns a transaction-aware adapter.
+// ArangoTransactionContext wraps an ArangoDB transaction for Casbin.
 type ArangoTransactionContext struct {
 	tx             arangodb.Transaction
 	ctx            context.Context
@@ -789,8 +783,8 @@ func (atx *ArangoTransactionContext) Rollback() error {
 	return err
 }
 
-// GetAdapter returns an adapter that operates within this transaction.
-// All policy operations through this adapter will be part of the transaction.
+// GetAdapter returns an adapter that uses this transaction.
+// Any policies you add/remove through it will be part of the transaction.
 func (atx *ArangoTransactionContext) GetAdapter() persist.Adapter {
 	return &Adapter{
 		client:         atx.adapter.client,
@@ -803,9 +797,8 @@ func (atx *ArangoTransactionContext) GetAdapter() persist.Adapter {
 	}
 }
 
-// Preview validates rules against the model before loading.
-// It filters out invalid rules that don't match the model structure,
-// preventing partial failures during policy loading.
+// Preview checks which rules are valid for the model.
+// Filters out rules that don't match, so you don't get partial load failures.
 func (a *Adapter) Preview(rules *[]CasbinRule, model model.Model) error {
 	j := 0
 	for i, rule := range *rules {
