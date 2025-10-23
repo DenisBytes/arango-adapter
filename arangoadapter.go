@@ -780,3 +780,40 @@ func (atx *ArangoTransactionContext) GetAdapter() persist.Adapter {
 		transaction:    atx.tx, // Use transaction
 	}
 }
+
+// Preview validates rules against the model before loading.
+// It filters out invalid rules that don't match the model structure,
+// preventing partial failures during policy loading.
+func (a *Adapter) Preview(rules *[]CasbinRule, model model.Model) error {
+	j := 0
+	for i, rule := range *rules {
+		// Build policy array
+		r := []string{rule.Ptype, rule.V0, rule.V1, rule.V2, rule.V3, rule.V4, rule.V5}
+
+		// Trim trailing empty fields
+		index := len(r) - 1
+		for r[index] == "" {
+			index--
+		}
+		p := r[:index+1]
+
+		key := p[0]
+		sec := key[:1]
+
+		// Check if this policy is valid for the model
+		ok, err := model.HasPolicyEx(sec, key, p[1:])
+		if err != nil {
+			return err
+		}
+
+		// Keep only valid rules
+		if ok {
+			(*rules)[j], (*rules)[i] = rule, (*rules)[j]
+			j++
+		}
+	}
+
+	// Truncate to valid rules only
+	*rules = (*rules)[j:]
+	return nil
+}
