@@ -326,22 +326,9 @@ func (a *Adapter) SavePolicy(model model.Model) error {
 }
 
 // SavePolicyCtx is like SavePolicy but with context support.
+// Uses batching to handle large policy sets efficiently.
 func (a *Adapter) SavePolicyCtx(ctx context.Context, model model.Model) error {
-	var rules []CasbinRule
-
-	// Collect all the "p" type rules (permissions)
-	for ptype, ast := range model["p"] {
-		for _, rule := range ast.Policy {
-			rules = append(rules, a.savePolicyLine(ptype, rule))
-		}
-	}
-
-	// Collect all the "g" type rules (roles/groups)
-	for ptype, ast := range model["g"] {
-		for _, rule := range ast.Policy {
-			rules = append(rules, a.savePolicyLine(ptype, rule))
-		}
-	}
+	const batchSize = 1000
 
 	// Clear everything out first
 	err := a.collection.Truncate(ctx)
@@ -349,9 +336,47 @@ func (a *Adapter) SavePolicyCtx(ctx context.Context, model model.Model) error {
 		return err
 	}
 
-	// Then insert all the rules
-	_, err = a.collection.CreateDocuments(ctx, rules)
-	return err
+	var batch []CasbinRule
+
+	// Flush the current batch to database
+	flushBatch := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		_, err := a.collection.CreateDocuments(ctx, batch)
+		if err != nil {
+			return err
+		}
+		batch = batch[:0] // Reset batch
+		return nil
+	}
+
+	// Collect and batch "p" type rules (permissions)
+	for ptype, ast := range model["p"] {
+		for _, rule := range ast.Policy {
+			batch = append(batch, a.savePolicyLine(ptype, rule))
+			if len(batch) >= batchSize {
+				if err := flushBatch(); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	// Collect and batch "g" type rules (roles/groups)
+	for ptype, ast := range model["g"] {
+		for _, rule := range ast.Policy {
+			batch = append(batch, a.savePolicyLine(ptype, rule))
+			if len(batch) >= batchSize {
+				if err := flushBatch(); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	// Flush any remaining rules
+	return flushBatch()
 }
 
 // savePolicyLine converts a Casbin rule into a database-friendly format.
