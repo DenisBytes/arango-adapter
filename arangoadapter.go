@@ -67,12 +67,13 @@ type Adapter struct {
 // It automatically creates the database and collection if they don't exist.
 //
 // Example:
-//   adapter, err := NewAdapter(
-//       WithEndpoints("http://localhost:8529"),
-//       WithAuthentication("root", "password"),
-//       WithDatabase("casbin"),
-//       WithCollection("casbin_rule"),
-//   )
+//
+//	adapter, err := NewAdapter(
+//	    WithEndpoints("http://localhost:8529"),
+//	    WithAuthentication("root", "password"),
+//	    WithDatabase("casbin"),
+//	    WithCollection("casbin_rule"),
+//	)
 func NewAdapter(opts ...Option) (*Adapter, error) {
 	cfg := NewConfig(opts...)
 	client, err := cfg.createConnection()
@@ -206,7 +207,9 @@ func (a *Adapter) LoadPolicyCtx(ctx context.Context, model model.Model) error {
 	if err != nil {
 		return err
 	}
-	defer cursor.Close()
+	defer func() {
+		_ = cursor.Close()
+	}()
 
 	for cursor.HasMore() {
 		var rule CasbinRule
@@ -308,16 +311,16 @@ func (a *Adapter) LoadFilteredPolicyCtx(ctx context.Context, model model.Model, 
 			var rule CasbinRule
 			_, err := cursor.ReadDocument(ctx, &rule)
 			if err != nil {
-				cursor.Close()
+				_ = cursor.Close()
 				return err
 			}
 
 			if err := loadPolicyLine(rule, model); err != nil {
-				cursor.Close()
+				_ = cursor.Close()
 				return err
 			}
 		}
-		cursor.Close()
+		_ = cursor.Close()
 	}
 
 	a.isFiltered = true

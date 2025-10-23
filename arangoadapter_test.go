@@ -5,8 +5,6 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/arangodb/go-driver/v2/arangodb"
-	"github.com/arangodb/go-driver/v2/connection"
 	"github.com/casbin/casbin/v2"
 	"github.com/casbin/casbin/v2/model"
 )
@@ -27,29 +25,12 @@ func setupTestAdapter(t *testing.T) *Adapter {
 	return adapter
 }
 
-// Helper for testing the old NewAdapterFromClient method
-func setupTestAdapterFromClient(t *testing.T) *Adapter {
-	endpoint := connection.NewRoundRobinEndpoints([]string{"http://localhost:8529"})
-	config := connection.DefaultHTTP2ConfigurationWrapper(endpoint, false)
-	config.Authentication = connection.NewBasicAuth("root", "")
-	conn := connection.NewHttp2Connection(config)
-
-	client := arangodb.NewClient(conn)
-
-	adapter, err := NewAdapterFromClient(client, "casbin_test_old", "casbin_rule_test_old")
-	if err != nil {
-		t.Skipf("Could not connect to ArangoDB: %v (skipping test)", err)
-	}
-
-	return adapter
-}
-
 // Clean up test database
 func teardownTestAdapter(t *testing.T, adapter *Adapter) {
 	ctx := context.Background()
 	// Try to get and remove the test database
 	if db, err := adapter.client.Database(ctx, adapter.databaseName); err == nil {
-		db.Remove(ctx)
+		_ = db.Remove(ctx)
 	}
 }
 
@@ -82,8 +63,8 @@ func TestLoadAndSavePolicy(t *testing.T) {
 	m.AddDef("m", "m", "r.sub == p.sub && r.obj == p.obj && r.act == p.act")
 
 	// Add some test policies directly to the model
-	m.AddPolicy("p", "p", []string{"alice", "data1", "read"})
-	m.AddPolicy("p", "p", []string{"bob", "data2", "write"})
+	_ = m.AddPolicy("p", "p", []string{"alice", "data1", "read"})
+	_ = m.AddPolicy("p", "p", []string{"bob", "data2", "write"})
 
 	// Save to database
 	err := adapter.SavePolicy(m)
@@ -359,14 +340,14 @@ func TestIsFiltered(t *testing.T) {
 	m.AddDef("e", "e", "some(where (p.eft == allow))")
 	m.AddDef("m", "m", "r.sub == p.sub && r.obj == p.obj && r.act == p.act")
 
-	adapter.LoadPolicy(m)
+	_ = adapter.LoadPolicy(m)
 	if adapter.IsFiltered() {
 		t.Error("After LoadPolicy(), adapter should not be filtered")
 	}
 
 	// After filtered load, should be filtered
 	filter := Filter{V0: []string{"alice"}}
-	adapter.LoadFilteredPolicy(m, filter)
+	_ = adapter.LoadFilteredPolicy(m, filter)
 	if !adapter.IsFiltered() {
 		t.Error("After LoadFilteredPolicy(), adapter should be filtered")
 	}
@@ -403,8 +384,8 @@ m = r.sub == p.sub && r.obj == p.obj && r.act == p.act
 	}
 
 	// Add some policies
-	e.AddPolicy("alice", "data1", "read")
-	e.AddPolicy("bob", "data2", "write")
+	_, _ = e.AddPolicy("alice", "data1", "read")
+	_, _ = e.AddPolicy("bob", "data2", "write")
 
 	// Test enforcement
 	if allowed, _ := e.Enforce("alice", "data1", "read"); !allowed {
@@ -420,7 +401,7 @@ m = r.sub == p.sub && r.obj == p.obj && r.act == p.act
 	}
 
 	// Save and reload
-	e.SavePolicy()
+	_ = e.SavePolicy()
 
 	e2, err := casbin.NewEnforcer(m, adapter)
 	if err != nil {
@@ -463,8 +444,8 @@ m = r.sub == p.sub && r.obj == p.obj && r.act == p.act
 
 	// Test successful transaction
 	err = adapter.Transaction(e, func(e casbin.IEnforcer) error {
-		e.AddPolicy("alice", "data1", "read")
-		e.AddPolicy("bob", "data2", "write")
+		_, _ = e.AddPolicy("alice", "data1", "read")
+		_, _ = e.AddPolicy("bob", "data2", "write")
 		return nil
 	})
 
@@ -473,14 +454,14 @@ m = r.sub == p.sub && r.obj == p.obj && r.act == p.act
 	}
 
 	// Verify policies were committed
-	e.LoadPolicy()
+	_ = e.LoadPolicy()
 	if allowed, _ := e.Enforce("alice", "data1", "read"); !allowed {
 		t.Error("Transaction should have committed alice's policy")
 	}
 
 	// Test failed transaction (should rollback)
 	err = adapter.Transaction(e, func(e casbin.IEnforcer) error {
-		e.AddPolicy("charlie", "data3", "read")
+		_, _ = e.AddPolicy("charlie", "data3", "read")
 		return errors.New("intentional error")
 	})
 
@@ -489,7 +470,7 @@ m = r.sub == p.sub && r.obj == p.obj && r.act == p.act
 	}
 
 	// Verify charlie's policy was rolled back
-	e.LoadPolicy()
+	_ = e.LoadPolicy()
 	if allowed, _ := e.Enforce("charlie", "data3", "read"); allowed {
 		t.Error("Failed transaction should have been rolled back")
 	}
@@ -529,7 +510,7 @@ func TestBeginTransaction(t *testing.T) {
 	m.AddDef("e", "e", "some(where (p.eft == allow))")
 	m.AddDef("m", "m", "r.sub == p.sub && r.obj == p.obj && r.act == p.act")
 
-	adapter.LoadPolicy(m)
+	_ = adapter.LoadPolicy(m)
 	policies, _ := m.GetPolicy("p", "p")
 	if len(policies) != 1 {
 		t.Errorf("Expected 1 policy after commit, got %d", len(policies))
@@ -543,7 +524,7 @@ func TestTransactionRollback(t *testing.T) {
 	ctx := context.Background()
 
 	// Add initial policy
-	adapter.AddPolicy("", "p", []string{"alice", "data1", "read"})
+	_ = adapter.AddPolicy("", "p", []string{"alice", "data1", "read"})
 
 	// Begin transaction
 	txCtx, err := adapter.BeginTransaction(ctx)
@@ -554,7 +535,7 @@ func TestTransactionRollback(t *testing.T) {
 	txAdapter := txCtx.GetAdapter()
 
 	// Add policy in transaction
-	txAdapter.AddPolicy("", "p", []string{"bob", "data2", "write"})
+	_ = txAdapter.AddPolicy("", "p", []string{"bob", "data2", "write"})
 
 	// Rollback
 	err = txCtx.Rollback()
@@ -569,7 +550,7 @@ func TestTransactionRollback(t *testing.T) {
 	m.AddDef("e", "e", "some(where (p.eft == allow))")
 	m.AddDef("m", "m", "r.sub == p.sub && r.obj == p.obj && r.act == p.act")
 
-	adapter.LoadPolicy(m)
+	_ = adapter.LoadPolicy(m)
 	policies, _ := m.GetPolicy("p", "p")
 	if len(policies) != 1 {
 		t.Errorf("Expected 1 policy (alice only), got %d", len(policies))
@@ -594,8 +575,8 @@ func TestPreview(t *testing.T) {
 	}
 
 	// Add policies to model first
-	m.AddPolicy("p", "p", []string{"alice", "data1", "read"})
-	m.AddPolicy("p", "p", []string{"bob", "data2", "write"})
+	_ = m.AddPolicy("p", "p", []string{"alice", "data1", "read"})
+	_ = m.AddPolicy("p", "p", []string{"bob", "data2", "write"})
 
 	// Preview should keep only rules that exist in model
 	err := adapter.Preview(&rules, m)

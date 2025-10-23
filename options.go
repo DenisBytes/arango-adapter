@@ -12,13 +12,13 @@ import (
 
 // Config holds the configuration for connecting to ArangoDB.
 type Config struct {
-	Endpoints      []string // ArangoDB endpoints (e.g., ["http://localhost:8529"])
-	Username       string   // Database username
-	Password       string   // Database password
-	DatabaseName   string   // Name of the database to use
-	CollectionName string   // Name of the collection for Casbin rules
-	TLSEnabled     bool     // Whether to use TLS
-	CACertPath     string   // Path to CA certificate file (for TLS)
+	Endpoints      []string    // ArangoDB endpoints (e.g., ["http://localhost:8529"])
+	Username       string      // Database username
+	Password       string      // Database password
+	DatabaseName   string      // Name of the database to use
+	CollectionName string      // Name of the collection for Casbin rules
+	TLSEnabled     bool        // Whether to use TLS
+	CACertPath     string      // Path to CA certificate file (for TLS)
 	TLSConfig      *tls.Config // Custom TLS configuration (optional)
 }
 
