@@ -27,7 +27,7 @@ func setupTestAdapter(t *testing.T) *Adapter {
 	return adapter
 }
 
-// Helper function to create a test adapter using the old method (for backward compatibility tests)
+// Helper for testing the old NewAdapterFromClient method
 func setupTestAdapterFromClient(t *testing.T) *Adapter {
 	endpoint := connection.NewRoundRobinEndpoints([]string{"http://localhost:8529"})
 	config := connection.DefaultHTTP2ConfigurationWrapper(endpoint, false)
