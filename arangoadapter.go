@@ -4,6 +4,7 @@ package arangoadapter
 
 import (
 	"context"
+	"strings"
 	"sync"
 
 	"github.com/arangodb/go-driver/v2/arangodb"
@@ -27,6 +28,23 @@ type CasbinRule struct {
 	V3    string `json:"v3"`
 	V4    string `json:"v4"`
 	V5    string `json:"v5"`
+}
+
+// Filter lets you query policies based on specific field values.
+// Each field is a slice so you can match against multiple values.
+type Filter struct {
+	Ptype []string
+	V0    []string
+	V1    []string
+	V2    []string
+	V3    []string
+	V4    []string
+	V5    []string
+}
+
+// BatchFilter wraps multiple filters for batch operations.
+type BatchFilter struct {
+	filters []Filter
 }
 
 // Adapter is the main struct that connects Casbin to ArangoDB.
@@ -193,6 +211,112 @@ func (a *Adapter) LoadPolicyCtx(ctx context.Context, model model.Model) error {
 	}
 
 	return nil
+}
+
+// LoadFilteredPolicy loads only policies that match the filter from the database.
+// This is essential for applications with large policy sets where loading everything
+// into memory isn't practical.
+func (a *Adapter) LoadFilteredPolicy(model model.Model, filter interface{}) error {
+	return a.LoadFilteredPolicyCtx(context.Background(), model, filter)
+}
+
+// LoadFilteredPolicyCtx loads filtered policies with context support.
+func (a *Adapter) LoadFilteredPolicyCtx(ctx context.Context, model model.Model, filter interface{}) error {
+	// Handle different filter types
+	var filters []Filter
+	switch f := filter.(type) {
+	case Filter:
+		filters = []Filter{f}
+	case *Filter:
+		filters = []Filter{*f}
+	case []Filter:
+		filters = f
+	case BatchFilter:
+		filters = f.filters
+	case *BatchFilter:
+		filters = f.filters
+	default:
+		return nil // No filter means load everything
+	}
+
+	if len(filters) == 0 {
+		return a.LoadPolicyCtx(ctx, model)
+	}
+
+	// Apply each filter and load matching policies
+	for _, f := range filters {
+		query := "FOR doc IN @@collection"
+		bindVars := map[string]interface{}{
+			"@collection": a.collectionName,
+		}
+
+		// Build filter conditions
+		conditions := []string{}
+		if len(f.Ptype) > 0 {
+			conditions = append(conditions, "doc.ptype IN @ptype")
+			bindVars["ptype"] = f.Ptype
+		}
+		if len(f.V0) > 0 {
+			conditions = append(conditions, "doc.v0 IN @v0")
+			bindVars["v0"] = f.V0
+		}
+		if len(f.V1) > 0 {
+			conditions = append(conditions, "doc.v1 IN @v1")
+			bindVars["v1"] = f.V1
+		}
+		if len(f.V2) > 0 {
+			conditions = append(conditions, "doc.v2 IN @v2")
+			bindVars["v2"] = f.V2
+		}
+		if len(f.V3) > 0 {
+			conditions = append(conditions, "doc.v3 IN @v3")
+			bindVars["v3"] = f.V3
+		}
+		if len(f.V4) > 0 {
+			conditions = append(conditions, "doc.v4 IN @v4")
+			bindVars["v4"] = f.V4
+		}
+		if len(f.V5) > 0 {
+			conditions = append(conditions, "doc.v5 IN @v5")
+			bindVars["v5"] = f.V5
+		}
+
+		// Add FILTER clause if we have conditions
+		if len(conditions) > 0 {
+			query += " FILTER " + strings.Join(conditions, " AND ")
+		}
+		query += " RETURN doc"
+
+		cursor, err := a.db.Query(ctx, query, &arangodb.QueryOptions{
+			BindVars: bindVars,
+		})
+		if err != nil {
+			return err
+		}
+
+		for cursor.HasMore() {
+			var rule CasbinRule
+			_, err := cursor.ReadDocument(ctx, &rule)
+			if err != nil {
+				cursor.Close()
+				return err
+			}
+
+			if err := loadPolicyLine(rule, model); err != nil {
+				cursor.Close()
+				return err
+			}
+		}
+		cursor.Close()
+	}
+
+	a.isFiltered = true
+	return nil
+}
+
+// IsFiltered returns true if the loaded policy has been filtered.
+func (a *Adapter) IsFiltered() bool {
+	return a.isFiltered
 }
 
 // SavePolicy saves all policies from the Casbin model back to the database.
