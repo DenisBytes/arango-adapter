@@ -17,7 +17,7 @@ jobs:
         ports:
           - 8529:8529
         env:
-          ARANGO_ROOT_PASSWORD: ""
+          ARANGO_NO_AUTH: "1"
         options: >-
           --health-cmd "wget --spider http://localhost:8529/_api/version"
           --health-interval 10s
