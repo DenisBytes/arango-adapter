@@ -98,6 +98,18 @@ func NewAdapter(opts ...Option) (*Adapter, error) {
 	return a, nil
 }
 
+// NewFilteredAdapter creates a filtered adapter that won't auto-load all policies.
+// Casbin won't automatically call LoadPolicy() for filtered adapters.
+// You'll need to manually call LoadFilteredPolicy() with your filter criteria.
+func NewFilteredAdapter(opts ...Option) (*Adapter, error) {
+	adapter, err := NewAdapter(opts...)
+	if err != nil {
+		return nil, err
+	}
+	adapter.isFiltered = true
+	return adapter, nil
+}
+
 // NewAdapterFromClient creates a new ArangoDB adapter from an existing client.
 // This is useful when you already have an ArangoDB client configured.
 // It'll automatically create the database and collection if they don't exist.

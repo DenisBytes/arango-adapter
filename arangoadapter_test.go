@@ -2,6 +2,7 @@ package arangoadapter
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/arangodb/go-driver/v2/arangodb"
@@ -429,5 +430,224 @@ m = r.sub == p.sub && r.obj == p.obj && r.act == p.act
 	// Verify policies persisted
 	if allowed, _ := e2.Enforce("alice", "data1", "read"); !allowed {
 		t.Error("Alice should still be able to read data1 after reload")
+	}
+}
+
+func TestTransaction(t *testing.T) {
+	adapter := setupTestAdapter(t)
+	defer teardownTestAdapter(t, adapter)
+
+	modelText := `
+[request_definition]
+r = sub, obj, act
+
+[policy_definition]
+p = sub, obj, act
+
+[policy_effect]
+e = some(where (p.eft == allow))
+
+[matchers]
+m = r.sub == p.sub && r.obj == p.obj && r.act == p.act
+`
+
+	m, err := model.NewModelFromString(modelText)
+	if err != nil {
+		t.Fatalf("Failed to create model: %v", err)
+	}
+
+	e, err := casbin.NewEnforcer(m, adapter)
+	if err != nil {
+		t.Fatalf("Failed to create enforcer: %v", err)
+	}
+
+	// Test successful transaction
+	err = adapter.Transaction(e, func(e casbin.IEnforcer) error {
+		e.AddPolicy("alice", "data1", "read")
+		e.AddPolicy("bob", "data2", "write")
+		return nil
+	})
+
+	if err != nil {
+		t.Fatalf("Transaction failed: %v", err)
+	}
+
+	// Verify policies were committed
+	e.LoadPolicy()
+	if allowed, _ := e.Enforce("alice", "data1", "read"); !allowed {
+		t.Error("Transaction should have committed alice's policy")
+	}
+
+	// Test failed transaction (should rollback)
+	err = adapter.Transaction(e, func(e casbin.IEnforcer) error {
+		e.AddPolicy("charlie", "data3", "read")
+		return errors.New("intentional error")
+	})
+
+	if err == nil {
+		t.Error("Expected transaction to fail")
+	}
+
+	// Verify charlie's policy was rolled back
+	e.LoadPolicy()
+	if allowed, _ := e.Enforce("charlie", "data3", "read"); allowed {
+		t.Error("Failed transaction should have been rolled back")
+	}
+}
+
+func TestBeginTransaction(t *testing.T) {
+	adapter := setupTestAdapter(t)
+	defer teardownTestAdapter(t, adapter)
+
+	ctx := context.Background()
+
+	// Begin transaction
+	txCtx, err := adapter.BeginTransaction(ctx)
+	if err != nil {
+		t.Fatalf("Failed to begin transaction: %v", err)
+	}
+
+	// Get transaction adapter
+	txAdapter := txCtx.GetAdapter()
+
+	// Add policies within transaction
+	err = txAdapter.AddPolicy("", "p", []string{"alice", "data1", "read"})
+	if err != nil {
+		t.Fatalf("Failed to add policy in transaction: %v", err)
+	}
+
+	// Commit transaction
+	err = txCtx.Commit()
+	if err != nil {
+		t.Fatalf("Failed to commit transaction: %v", err)
+	}
+
+	// Verify policy was committed
+	m := model.NewModel()
+	m.AddDef("r", "r", "sub, obj, act")
+	m.AddDef("p", "p", "sub, obj, act")
+	m.AddDef("e", "e", "some(where (p.eft == allow))")
+	m.AddDef("m", "m", "r.sub == p.sub && r.obj == p.obj && r.act == p.act")
+
+	adapter.LoadPolicy(m)
+	policies, _ := m.GetPolicy("p", "p")
+	if len(policies) != 1 {
+		t.Errorf("Expected 1 policy after commit, got %d", len(policies))
+	}
+}
+
+func TestTransactionRollback(t *testing.T) {
+	adapter := setupTestAdapter(t)
+	defer teardownTestAdapter(t, adapter)
+
+	ctx := context.Background()
+
+	// Add initial policy
+	adapter.AddPolicy("", "p", []string{"alice", "data1", "read"})
+
+	// Begin transaction
+	txCtx, err := adapter.BeginTransaction(ctx)
+	if err != nil {
+		t.Fatalf("Failed to begin transaction: %v", err)
+	}
+
+	txAdapter := txCtx.GetAdapter()
+
+	// Add policy in transaction
+	txAdapter.AddPolicy("", "p", []string{"bob", "data2", "write"})
+
+	// Rollback
+	err = txCtx.Rollback()
+	if err != nil {
+		t.Fatalf("Failed to rollback: %v", err)
+	}
+
+	// Verify bob's policy was not added
+	m := model.NewModel()
+	m.AddDef("r", "r", "sub, obj, act")
+	m.AddDef("p", "p", "sub, obj, act")
+	m.AddDef("e", "e", "some(where (p.eft == allow))")
+	m.AddDef("m", "m", "r.sub == p.sub && r.obj == p.obj && r.act == p.act")
+
+	adapter.LoadPolicy(m)
+	policies, _ := m.GetPolicy("p", "p")
+	if len(policies) != 1 {
+		t.Errorf("Expected 1 policy (alice only), got %d", len(policies))
+	}
+}
+
+func TestPreview(t *testing.T) {
+	adapter := setupTestAdapter(t)
+	defer teardownTestAdapter(t, adapter)
+
+	m := model.NewModel()
+	m.AddDef("r", "r", "sub, obj, act")
+	m.AddDef("p", "p", "sub, obj, act")
+	m.AddDef("e", "e", "some(where (p.eft == allow))")
+	m.AddDef("m", "m", "r.sub == p.sub && r.obj == p.obj && r.act == p.act")
+
+	// Create some rules
+	rules := []CasbinRule{
+		{Ptype: "p", V0: "alice", V1: "data1", V2: "read"},
+		{Ptype: "p", V0: "bob", V1: "data2", V2: "write"},
+		{Ptype: "p", V0: "charlie", V1: "data3", V2: "read"},
+	}
+
+	// Add policies to model first
+	m.AddPolicy("p", "p", []string{"alice", "data1", "read"})
+	m.AddPolicy("p", "p", []string{"bob", "data2", "write"})
+
+	// Preview should keep only rules that exist in model
+	err := adapter.Preview(&rules, m)
+	if err != nil {
+		t.Fatalf("Preview failed: %v", err)
+	}
+
+	// Charlie's rule should be filtered out
+	if len(rules) != 2 {
+		t.Errorf("Expected 2 valid rules, got %d", len(rules))
+	}
+
+	// Verify the remaining rules are alice and bob
+	validNames := map[string]bool{"alice": false, "bob": false}
+	for _, rule := range rules {
+		if _, ok := validNames[rule.V0]; ok {
+			validNames[rule.V0] = true
+		}
+	}
+
+	if !validNames["alice"] || !validNames["bob"] {
+		t.Error("Preview should have kept alice and bob's rules")
+	}
+}
+
+func TestClose(t *testing.T) {
+	adapter := setupTestAdapter(t)
+	defer teardownTestAdapter(t, adapter)
+
+	// Close should not error (even though it's a no-op for ArangoDB)
+	err := adapter.Close()
+	if err != nil {
+		t.Errorf("Close should not error: %v", err)
+	}
+}
+
+func TestNewFilteredAdapter(t *testing.T) {
+	adapter, err := NewFilteredAdapter(
+		WithEndpoints("http://localhost:8529"),
+		WithAuthentication("root", ""),
+		WithDatabase("casbin_test_filtered"),
+		WithCollection("casbin_rule_filtered"),
+	)
+
+	if err != nil {
+		t.Skipf("Could not create filtered adapter: %v", err)
+	}
+
+	defer teardownTestAdapter(t, adapter)
+
+	// Filtered adapter should report as filtered from the start
+	if !adapter.IsFiltered() {
+		t.Error("NewFilteredAdapter should create filtered adapter")
 	}
 }
