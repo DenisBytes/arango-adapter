@@ -1,10 +1,24 @@
-// Package arangoadapter provides a Casbin adapter for ArangoDB.
-// It allows you to persist authorization policies in ArangoDB instead of local files.
+// Copyright 2024 The casbin Authors. All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package arangoadapter provides a Casbin adapter implementation for ArangoDB.
 package arangoadapter
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 
@@ -19,11 +33,10 @@ const (
 	defaultCollectionName = "casbin_rule"
 )
 
-// CasbinRule represents a single policy rule in ArangoDB.
-// Casbin supports up to 6 values per rule, so we've got V0 through V5.
+// CasbinRule represents a single Casbin policy rule stored as an ArangoDB document.
 type CasbinRule struct {
-	Key   string `json:"_key,omitempty"` // ArangoDB document key
-	Ptype string `json:"ptype"`          // Policy type (p, g, p2, g2, etc.)
+	Key   string `json:"_key,omitempty"`
+	Ptype string `json:"ptype"`
 	V0    string `json:"v0"`
 	V1    string `json:"v1"`
 	V2    string `json:"v2"`
@@ -32,8 +45,8 @@ type CasbinRule struct {
 	V5    string `json:"v5"`
 }
 
-// Filter lets you query policies based on specific field values.
-// Each field is a slice so you can match against multiple values.
+// Filter defines the filtering criteria for loading policies.
+// Each field accepts multiple values to match against.
 type Filter struct {
 	Ptype []string
 	V0    []string
@@ -44,13 +57,12 @@ type Filter struct {
 	V5    []string
 }
 
-// BatchFilter wraps multiple filters for batch operations.
+// BatchFilter holds multiple filters for batch-filtered policy loading.
 type BatchFilter struct {
 	filters []Filter
 }
 
-// Adapter is the main struct that connects Casbin to ArangoDB.
-// It handles all the CRUD operations for policy rules.
+// Adapter represents the ArangoDB adapter for policy storage.
 type Adapter struct {
 	client         arangodb.Client
 	db             arangodb.Database
@@ -58,13 +70,13 @@ type Adapter struct {
 	databaseName   string
 	collectionName string
 	isFiltered     bool
-	transaction    arangodb.Transaction // Active transaction, if any
+	transaction    arangodb.Transaction
 	transactionMu  *sync.Mutex
 	muInitialize   sync.Once
 }
 
-// NewAdapter creates a new ArangoDB adapter using functional options.
-// It automatically creates the database and collection if they don't exist.
+// NewAdapter is the constructor for Adapter.
+// It creates the database and collection if they don't already exist.
 //
 // Example:
 //
@@ -99,9 +111,8 @@ func NewAdapter(opts ...Option) (*Adapter, error) {
 	return a, nil
 }
 
-// NewFilteredAdapter creates a filtered adapter that won't auto-load all policies.
-// Casbin won't automatically call LoadPolicy() for filtered adapters.
-// You'll need to manually call LoadFilteredPolicy() with your filter criteria.
+// NewFilteredAdapter is the constructor for FilteredAdapter.
+// Casbin will not automatically call LoadPolicy() for a filtered adapter.
 func NewFilteredAdapter(opts ...Option) (*Adapter, error) {
 	adapter, err := NewAdapter(opts...)
 	if err != nil {
@@ -111,9 +122,8 @@ func NewFilteredAdapter(opts ...Option) (*Adapter, error) {
 	return adapter, nil
 }
 
-// NewAdapterFromClient creates a new ArangoDB adapter from an existing client.
-// This is useful when you already have an ArangoDB client configured.
-// It'll automatically create the database and collection if they don't exist.
+// NewAdapterFromClient creates an adapter from an existing ArangoDB client.
+// It creates the database and collection if they don't already exist.
 func NewAdapterFromClient(client arangodb.Client, databaseName string, collectionName string) (*Adapter, error) {
 	a := &Adapter{
 		client:         client,
@@ -133,14 +143,30 @@ func NewAdapterFromClient(client arangodb.Client, databaseName string, collectio
 	return a, nil
 }
 
-// ensureDatabaseExists gets or creates the database.
+// getCollection returns a transaction-bound collection if a transaction is active,
+// otherwise the default collection.
+func (a *Adapter) getCollection(ctx context.Context) (arangodb.Collection, error) {
+	if a.transaction != nil {
+		return a.transaction.GetCollection(ctx, a.collectionName, nil)
+	}
+	return a.collection, nil
+}
+
+// queryDB executes an AQL query, routing through the active transaction if one exists.
+func (a *Adapter) queryDB(ctx context.Context, query string, opts *arangodb.QueryOptions) (arangodb.Cursor, error) {
+	if a.transaction != nil {
+		if opts == nil {
+			opts = &arangodb.QueryOptions{}
+		}
+		opts.TransactionID = string(a.transaction.ID())
+	}
+	return a.db.Query(ctx, query, opts)
+}
+
 func (a *Adapter) ensureDatabaseExists() error {
 	ctx := context.Background()
-
-	// Try to get the database first
 	db, err := a.client.Database(ctx, a.databaseName)
 	if err != nil {
-		// Database doesn't exist, create it
 		db, err = a.client.CreateDatabase(ctx, a.databaseName, nil)
 		if err != nil {
 			return err
@@ -150,14 +176,10 @@ func (a *Adapter) ensureDatabaseExists() error {
 	return nil
 }
 
-// ensureCollectionExists gets or creates the collection.
 func (a *Adapter) ensureCollectionExists() error {
 	ctx := context.Background()
-
-	// Try to get the collection first
 	col, err := a.db.Collection(ctx, a.collectionName)
 	if err != nil {
-		// Collection doesn't exist, create it
 		col, err = a.db.CreateCollection(ctx, a.collectionName, nil)
 		if err != nil {
 			return err
@@ -167,41 +189,36 @@ func (a *Adapter) ensureCollectionExists() error {
 	return nil
 }
 
-// loadPolicyLine converts a database rule into a Casbin policy line.
 func loadPolicyLine(line CasbinRule, model model.Model) error {
 	if line.Ptype == "" {
 		return nil
 	}
 
-	// Build the policy array
-	var p []string
-	p = append(p, line.Ptype, line.V0, line.V1, line.V2, line.V3, line.V4, line.V5)
+	p := []string{line.Ptype, line.V0, line.V1, line.V2, line.V3, line.V4, line.V5}
 
-	// Trim trailing empty fields since Casbin doesn't need them
+	// Trim trailing empty fields
 	index := len(p) - 1
 	for p[index] == "" {
 		index--
 	}
 	p = p[:index+1]
 
-	// Load into model
 	return persist.LoadPolicyArray(p, model)
 }
 
-// LoadPolicy loads all policies from the database into the Casbin model.
-// This is called when Casbin initializes.
+// LoadPolicy loads all policy rules from the database.
 func (a *Adapter) LoadPolicy(model model.Model) error {
 	return a.LoadPolicyCtx(context.Background(), model)
 }
 
-// LoadPolicyCtx is like LoadPolicy but with context support for cancellation and timeouts.
+// LoadPolicyCtx loads all policy rules from the database with context support.
 func (a *Adapter) LoadPolicyCtx(ctx context.Context, model model.Model) error {
 	query := "FOR doc IN @@collection RETURN doc"
 	bindVars := map[string]interface{}{
 		"@collection": a.collectionName,
 	}
 
-	cursor, err := a.db.Query(ctx, query, &arangodb.QueryOptions{
+	cursor, err := a.queryDB(ctx, query, &arangodb.QueryOptions{
 		BindVars: bindVars,
 	})
 	if err != nil {
@@ -227,15 +244,13 @@ func (a *Adapter) LoadPolicyCtx(ctx context.Context, model model.Model) error {
 	return nil
 }
 
-// LoadFilteredPolicy loads only policies that match the filter.
-// Useful when you have millions of policies and don't want to load them all.
+// LoadFilteredPolicy loads only policy rules that match the filter.
 func (a *Adapter) LoadFilteredPolicy(model model.Model, filter interface{}) error {
 	return a.LoadFilteredPolicyCtx(context.Background(), model, filter)
 }
 
-// LoadFilteredPolicyCtx loads filtered policies with context support.
+// LoadFilteredPolicyCtx loads filtered policy rules with context support.
 func (a *Adapter) LoadFilteredPolicyCtx(ctx context.Context, model model.Model, filter interface{}) error {
-	// Handle different filter types
 	var filters []Filter
 	switch f := filter.(type) {
 	case Filter:
@@ -249,21 +264,19 @@ func (a *Adapter) LoadFilteredPolicyCtx(ctx context.Context, model model.Model, 
 	case *BatchFilter:
 		filters = f.filters
 	default:
-		return nil // No filter means load everything
+		return nil
 	}
 
 	if len(filters) == 0 {
 		return a.LoadPolicyCtx(ctx, model)
 	}
 
-	// Apply each filter and load matching policies
 	for _, f := range filters {
 		query := "FOR doc IN @@collection"
 		bindVars := map[string]interface{}{
 			"@collection": a.collectionName,
 		}
 
-		// Build filter conditions
 		conditions := []string{}
 		if len(f.Ptype) > 0 {
 			conditions = append(conditions, "doc.ptype IN @ptype")
@@ -294,13 +307,12 @@ func (a *Adapter) LoadFilteredPolicyCtx(ctx context.Context, model model.Model, 
 			bindVars["v5"] = f.V5
 		}
 
-		// Add FILTER clause if we have conditions
 		if len(conditions) > 0 {
 			query += " FILTER " + strings.Join(conditions, " AND ")
 		}
 		query += " RETURN doc"
 
-		cursor, err := a.db.Query(ctx, query, &arangodb.QueryOptions{
+		cursor, err := a.queryDB(ctx, query, &arangodb.QueryOptions{
 			BindVars: bindVars,
 		})
 		if err != nil {
@@ -332,39 +344,39 @@ func (a *Adapter) IsFiltered() bool {
 	return a.isFiltered
 }
 
-// SavePolicy saves all policies from the Casbin model back to the database.
-// Warning: This wipes out the entire collection and replaces it with the current policy set.
+// SavePolicy saves all policy rules to the database.
 func (a *Adapter) SavePolicy(model model.Model) error {
 	return a.SavePolicyCtx(context.Background(), model)
 }
 
-// SavePolicyCtx is like SavePolicy but with context support.
-// Uses batching to handle large policy sets efficiently.
+// SavePolicyCtx saves all policy rules to the database with context support.
 func (a *Adapter) SavePolicyCtx(ctx context.Context, model model.Model) error {
 	const batchSize = 1000
 
-	// Clear everything out first
-	err := a.collection.Truncate(ctx)
+	col, err := a.getCollection(ctx)
+	if err != nil {
+		return err
+	}
+
+	err = col.Truncate(ctx)
 	if err != nil {
 		return err
 	}
 
 	var batch []CasbinRule
 
-	// Flush the current batch to database
 	flushBatch := func() error {
 		if len(batch) == 0 {
 			return nil
 		}
-		_, err := a.collection.CreateDocuments(ctx, batch)
+		_, err := col.CreateDocuments(ctx, batch)
 		if err != nil {
 			return err
 		}
-		batch = batch[:0] // Reset batch
+		batch = batch[:0]
 		return nil
 	}
 
-	// Collect and batch "p" type rules (permissions)
 	for ptype, ast := range model["p"] {
 		for _, rule := range ast.Policy {
 			batch = append(batch, a.savePolicyLine(ptype, rule))
@@ -376,7 +388,6 @@ func (a *Adapter) SavePolicyCtx(ctx context.Context, model model.Model) error {
 		}
 	}
 
-	// Collect and batch "g" type rules (roles/groups)
 	for ptype, ast := range model["g"] {
 		for _, rule := range ast.Policy {
 			batch = append(batch, a.savePolicyLine(ptype, rule))
@@ -388,17 +399,14 @@ func (a *Adapter) SavePolicyCtx(ctx context.Context, model model.Model) error {
 		}
 	}
 
-	// Flush any remaining rules
 	return flushBatch()
 }
 
-// savePolicyLine converts a Casbin rule into a database-friendly format.
 func (a *Adapter) savePolicyLine(ptype string, rule []string) CasbinRule {
 	line := CasbinRule{
 		Ptype: ptype,
 	}
 
-	// Copy over whatever values we have
 	if len(rule) > 0 {
 		line.V0 = rule[0]
 	}
@@ -421,25 +429,28 @@ func (a *Adapter) savePolicyLine(ptype string, rule []string) CasbinRule {
 	return line
 }
 
-// AddPolicy adds a single policy rule to the database.
+// AddPolicy adds a policy rule to the storage.
 func (a *Adapter) AddPolicy(sec string, ptype string, rule []string) error {
 	return a.AddPolicyCtx(context.Background(), sec, ptype, rule)
 }
 
-// AddPolicyCtx is like AddPolicy but with context support.
+// AddPolicyCtx adds a policy rule to the storage with context support.
 func (a *Adapter) AddPolicyCtx(ctx context.Context, sec string, ptype string, rule []string) error {
+	col, err := a.getCollection(ctx)
+	if err != nil {
+		return err
+	}
 	line := a.savePolicyLine(ptype, rule)
-	_, err := a.collection.CreateDocument(ctx, line)
+	_, err = col.CreateDocument(ctx, line)
 	return err
 }
 
-// RemovePolicy removes a single policy rule from the database.
+// RemovePolicy removes a policy rule from the storage.
 func (a *Adapter) RemovePolicy(sec string, ptype string, rule []string) error {
 	return a.RemovePolicyCtx(context.Background(), sec, ptype, rule)
 }
 
-// RemovePolicyCtx is like RemovePolicy but with context support.
-// It builds a query to match the exact rule and removes it.
+// RemovePolicyCtx removes a policy rule from the storage with context support.
 func (a *Adapter) RemovePolicyCtx(ctx context.Context, sec string, ptype string, rule []string) error {
 	line := a.savePolicyLine(ptype, rule)
 	query := "FOR doc IN @@collection FILTER doc.ptype == @ptype"
@@ -448,7 +459,6 @@ func (a *Adapter) RemovePolicyCtx(ctx context.Context, sec string, ptype string,
 		"ptype":       line.Ptype,
 	}
 
-	// Build up the query dynamically based on which fields have values
 	if line.V0 != "" {
 		query += " && doc.v0 == @v0"
 		bindVars["v0"] = line.V0
@@ -476,49 +486,109 @@ func (a *Adapter) RemovePolicyCtx(ctx context.Context, sec string, ptype string,
 
 	query += " REMOVE doc IN @@collection"
 
-	_, err := a.db.Query(ctx, query, &arangodb.QueryOptions{
+	_, err := a.queryDB(ctx, query, &arangodb.QueryOptions{
 		BindVars: bindVars,
 	})
 	return err
 }
 
-// AddPolicies adds multiple policy rules at once.
+// AddPolicies adds multiple policy rules to the storage.
 func (a *Adapter) AddPolicies(sec string, ptype string, rules [][]string) error {
 	return a.AddPoliciesCtx(context.Background(), sec, ptype, rules)
 }
 
-// AddPoliciesCtx adds multiple policy rules with context support.
+// AddPoliciesCtx adds multiple policy rules to the storage with context support.
 func (a *Adapter) AddPoliciesCtx(ctx context.Context, sec string, ptype string, rules [][]string) error {
+	col, err := a.getCollection(ctx)
+	if err != nil {
+		return err
+	}
 	var lines []CasbinRule
 	for _, rule := range rules {
 		lines = append(lines, a.savePolicyLine(ptype, rule))
 	}
-	_, err := a.collection.CreateDocuments(ctx, lines)
+	_, err = col.CreateDocuments(ctx, lines)
 	return err
 }
 
-// RemovePolicies removes multiple policy rules at once.
+// RemovePolicies removes multiple policy rules from the storage.
 func (a *Adapter) RemovePolicies(sec string, ptype string, rules [][]string) error {
 	return a.RemovePoliciesCtx(context.Background(), sec, ptype, rules)
 }
 
-// RemovePoliciesCtx removes multiple policy rules with context support.
+// RemovePoliciesCtx removes multiple policy rules from the storage with context support.
 func (a *Adapter) RemovePoliciesCtx(ctx context.Context, sec string, ptype string, rules [][]string) error {
-	for _, rule := range rules {
-		err := a.RemovePolicyCtx(ctx, sec, ptype, rule)
-		if err != nil {
-			return err
+	if len(rules) == 0 {
+		return nil
+	}
+
+	query := "FOR doc IN @@collection FILTER doc.ptype == @ptype AND ("
+	bindVars := map[string]interface{}{
+		"@collection": a.collectionName,
+		"ptype":       ptype,
+	}
+
+	var ruleConditions []string
+	for i, rule := range rules {
+		line := a.savePolicyLine(ptype, rule)
+
+		var fieldConditions []string
+		if line.V0 != "" {
+			key := fmt.Sprintf("r%d_v0", i)
+			fieldConditions = append(fieldConditions, "doc.v0 == @"+key)
+			bindVars[key] = line.V0
+		}
+		if line.V1 != "" {
+			key := fmt.Sprintf("r%d_v1", i)
+			fieldConditions = append(fieldConditions, "doc.v1 == @"+key)
+			bindVars[key] = line.V1
+		}
+		if line.V2 != "" {
+			key := fmt.Sprintf("r%d_v2", i)
+			fieldConditions = append(fieldConditions, "doc.v2 == @"+key)
+			bindVars[key] = line.V2
+		}
+		if line.V3 != "" {
+			key := fmt.Sprintf("r%d_v3", i)
+			fieldConditions = append(fieldConditions, "doc.v3 == @"+key)
+			bindVars[key] = line.V3
+		}
+		if line.V4 != "" {
+			key := fmt.Sprintf("r%d_v4", i)
+			fieldConditions = append(fieldConditions, "doc.v4 == @"+key)
+			bindVars[key] = line.V4
+		}
+		if line.V5 != "" {
+			key := fmt.Sprintf("r%d_v5", i)
+			fieldConditions = append(fieldConditions, "doc.v5 == @"+key)
+			bindVars[key] = line.V5
+		}
+
+		if len(fieldConditions) > 0 {
+			ruleConditions = append(ruleConditions, "("+strings.Join(fieldConditions, " && ")+")")
 		}
 	}
-	return nil
+
+	// No field conditions means all fields were empty; return early to avoid an overly broad deletion.
+	if len(ruleConditions) == 0 {
+		return nil
+	}
+
+	query += strings.Join(ruleConditions, " OR ")
+	query += ") REMOVE doc IN @@collection"
+
+	_, err := a.queryDB(ctx, query, &arangodb.QueryOptions{
+		BindVars: bindVars,
+	})
+	return err
 }
 
-// RemoveFilteredPolicy removes policies that match a partial filter.
+// RemoveFilteredPolicy removes policy rules that match the filter.
 func (a *Adapter) RemoveFilteredPolicy(sec string, ptype string, fieldIndex int, fieldValues ...string) error {
 	return a.RemoveFilteredPolicyCtx(context.Background(), sec, ptype, fieldIndex, fieldValues...)
 }
 
-// RemoveFilteredPolicyCtx is like RemoveFilteredPolicy but with context support.
+// RemoveFilteredPolicyCtx removes filtered policy rules with context support.
 func (a *Adapter) RemoveFilteredPolicyCtx(ctx context.Context, sec string, ptype string, fieldIndex int, fieldValues ...string) error {
 	query := "FOR doc IN @@collection FILTER doc.ptype == @ptype"
 	bindVars := map[string]interface{}{
@@ -526,42 +596,46 @@ func (a *Adapter) RemoveFilteredPolicyCtx(ctx context.Context, sec string, ptype
 		"ptype":       ptype,
 	}
 
-	// The logic here maps the field values to the right V fields based on the starting index
-	if fieldIndex <= 0 && 0 < fieldIndex+len(fieldValues) {
+	if fieldIndex <= 0 && 0 < fieldIndex+len(fieldValues) && fieldValues[0-fieldIndex] != "" {
 		query += " && doc.v0 == @v0"
 		bindVars["v0"] = fieldValues[0-fieldIndex]
 	}
-	if fieldIndex <= 1 && 1 < fieldIndex+len(fieldValues) {
+	if fieldIndex <= 1 && 1 < fieldIndex+len(fieldValues) && fieldValues[1-fieldIndex] != "" {
 		query += " && doc.v1 == @v1"
 		bindVars["v1"] = fieldValues[1-fieldIndex]
 	}
-	if fieldIndex <= 2 && 2 < fieldIndex+len(fieldValues) {
+	if fieldIndex <= 2 && 2 < fieldIndex+len(fieldValues) && fieldValues[2-fieldIndex] != "" {
 		query += " && doc.v2 == @v2"
 		bindVars["v2"] = fieldValues[2-fieldIndex]
 	}
-	if fieldIndex <= 3 && 3 < fieldIndex+len(fieldValues) {
+	if fieldIndex <= 3 && 3 < fieldIndex+len(fieldValues) && fieldValues[3-fieldIndex] != "" {
 		query += " && doc.v3 == @v3"
 		bindVars["v3"] = fieldValues[3-fieldIndex]
 	}
-	if fieldIndex <= 4 && 4 < fieldIndex+len(fieldValues) {
+	if fieldIndex <= 4 && 4 < fieldIndex+len(fieldValues) && fieldValues[4-fieldIndex] != "" {
 		query += " && doc.v4 == @v4"
 		bindVars["v4"] = fieldValues[4-fieldIndex]
 	}
-	if fieldIndex <= 5 && 5 < fieldIndex+len(fieldValues) {
+	if fieldIndex <= 5 && 5 < fieldIndex+len(fieldValues) && fieldValues[5-fieldIndex] != "" {
 		query += " && doc.v5 == @v5"
 		bindVars["v5"] = fieldValues[5-fieldIndex]
 	}
 
 	query += " REMOVE doc IN @@collection"
 
-	_, err := a.db.Query(ctx, query, &arangodb.QueryOptions{
+	_, err := a.queryDB(ctx, query, &arangodb.QueryOptions{
 		BindVars: bindVars,
 	})
 	return err
 }
 
-// UpdatePolicy replaces an old policy rule with a new one.
+// UpdatePolicy updates a policy rule from the storage.
 func (a *Adapter) UpdatePolicy(sec string, ptype string, oldRule, newPolicy []string) error {
+	return a.UpdatePolicyCtx(context.Background(), sec, ptype, oldRule, newPolicy)
+}
+
+// UpdatePolicyCtx updates a policy rule from the storage with context support.
+func (a *Adapter) UpdatePolicyCtx(ctx context.Context, sec string, ptype string, oldRule, newPolicy []string) error {
 	oldLine := a.savePolicyLine(ptype, oldRule)
 	newLine := a.savePolicyLine(ptype, newPolicy)
 
@@ -571,7 +645,6 @@ func (a *Adapter) UpdatePolicy(sec string, ptype string, oldRule, newPolicy []st
 		"ptype":       oldLine.Ptype,
 	}
 
-	// Match the old rule
 	if oldLine.V0 != "" {
 		query += " && doc.v0 == @v0"
 		bindVars["v0"] = oldLine.V0
@@ -597,7 +670,6 @@ func (a *Adapter) UpdatePolicy(sec string, ptype string, oldRule, newPolicy []st
 		bindVars["v5"] = oldLine.V5
 	}
 
-	// Update it with the new values
 	query += " UPDATE doc WITH { ptype: @new_ptype, v0: @new_v0, v1: @new_v1, v2: @new_v2, v3: @new_v3, v4: @new_v4, v5: @new_v5 } IN @@collection"
 
 	bindVars["new_ptype"] = newLine.Ptype
@@ -608,16 +680,24 @@ func (a *Adapter) UpdatePolicy(sec string, ptype string, oldRule, newPolicy []st
 	bindVars["new_v4"] = newLine.V4
 	bindVars["new_v5"] = newLine.V5
 
-	_, err := a.db.Query(context.Background(), query, &arangodb.QueryOptions{
+	_, err := a.queryDB(ctx, query, &arangodb.QueryOptions{
 		BindVars: bindVars,
 	})
 	return err
 }
 
-// UpdatePolicies updates multiple policy rules at once.
+// UpdatePolicies updates multiple policy rules in the storage.
 func (a *Adapter) UpdatePolicies(sec string, ptype string, oldRules, newRules [][]string) error {
+	return a.UpdatePoliciesCtx(context.Background(), sec, ptype, oldRules, newRules)
+}
+
+// UpdatePoliciesCtx updates multiple policy rules in the storage with context support.
+func (a *Adapter) UpdatePoliciesCtx(ctx context.Context, sec string, ptype string, oldRules, newRules [][]string) error {
+	if len(oldRules) != len(newRules) {
+		return errors.New("oldRules and newRules must have the same length")
+	}
 	for i, oldRule := range oldRules {
-		err := a.UpdatePolicy(sec, ptype, oldRule, newRules[i])
+		err := a.UpdatePolicyCtx(ctx, sec, ptype, oldRule, newRules[i])
 		if err != nil {
 			return err
 		}
@@ -625,14 +705,84 @@ func (a *Adapter) UpdatePolicies(sec string, ptype string, oldRules, newRules []
 	return nil
 }
 
-// UpdateFilteredPolicies updates policies that match a filter.
-// Right now it just adds the new policies - doesn't remove old ones.
+// UpdateFilteredPolicies deletes old rules matching the filter and adds new ones.
 func (a *Adapter) UpdateFilteredPolicies(sec string, ptype string, newPolicies [][]string, fieldIndex int, fieldValues ...string) ([][]string, error) {
+	return a.UpdateFilteredPoliciesCtx(context.Background(), sec, ptype, newPolicies, fieldIndex, fieldValues...)
+}
+
+// UpdateFilteredPoliciesCtx deletes old rules matching the filter and adds new ones, with context support.
+func (a *Adapter) UpdateFilteredPoliciesCtx(ctx context.Context, sec string, ptype string, newPolicies [][]string, fieldIndex int, fieldValues ...string) ([][]string, error) {
+	// Load existing policies that match the filter before removing them
 	oldPolicies := make([][]string, 0)
 
-	for _, newPolicy := range newPolicies {
-		err := a.AddPolicy(sec, ptype, newPolicy)
+	query := "FOR doc IN @@collection FILTER doc.ptype == @ptype"
+	bindVars := map[string]interface{}{
+		"@collection": a.collectionName,
+		"ptype":       ptype,
+	}
+
+	if fieldIndex <= 0 && 0 < fieldIndex+len(fieldValues) && fieldValues[0-fieldIndex] != "" {
+		query += " && doc.v0 == @v0"
+		bindVars["v0"] = fieldValues[0-fieldIndex]
+	}
+	if fieldIndex <= 1 && 1 < fieldIndex+len(fieldValues) && fieldValues[1-fieldIndex] != "" {
+		query += " && doc.v1 == @v1"
+		bindVars["v1"] = fieldValues[1-fieldIndex]
+	}
+	if fieldIndex <= 2 && 2 < fieldIndex+len(fieldValues) && fieldValues[2-fieldIndex] != "" {
+		query += " && doc.v2 == @v2"
+		bindVars["v2"] = fieldValues[2-fieldIndex]
+	}
+	if fieldIndex <= 3 && 3 < fieldIndex+len(fieldValues) && fieldValues[3-fieldIndex] != "" {
+		query += " && doc.v3 == @v3"
+		bindVars["v3"] = fieldValues[3-fieldIndex]
+	}
+	if fieldIndex <= 4 && 4 < fieldIndex+len(fieldValues) && fieldValues[4-fieldIndex] != "" {
+		query += " && doc.v4 == @v4"
+		bindVars["v4"] = fieldValues[4-fieldIndex]
+	}
+	if fieldIndex <= 5 && 5 < fieldIndex+len(fieldValues) && fieldValues[5-fieldIndex] != "" {
+		query += " && doc.v5 == @v5"
+		bindVars["v5"] = fieldValues[5-fieldIndex]
+	}
+
+	// First, collect old policies that will be removed
+	selectQuery := query + " RETURN doc"
+	cursor, err := a.queryDB(ctx, selectQuery, &arangodb.QueryOptions{
+		BindVars: bindVars,
+	})
+	if err != nil {
+		return nil, err
+	}
+	for cursor.HasMore() {
+		var rule CasbinRule
+		_, err := cursor.ReadDocument(ctx, &rule)
 		if err != nil {
+			_ = cursor.Close()
+			return nil, err
+		}
+		policy := []string{rule.V0, rule.V1, rule.V2, rule.V3, rule.V4, rule.V5}
+		// Trim trailing empty fields
+		i := len(policy) - 1
+		for i >= 0 && policy[i] == "" {
+			i--
+		}
+		oldPolicies = append(oldPolicies, policy[:i+1])
+	}
+	_ = cursor.Close()
+
+	// Remove old policies matching the filter
+	removeQuery := query + " REMOVE doc IN @@collection"
+	_, err = a.queryDB(ctx, removeQuery, &arangodb.QueryOptions{
+		BindVars: bindVars,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Add new policies
+	for _, newPolicy := range newPolicies {
+		if err := a.AddPolicyCtx(ctx, sec, ptype, newPolicy); err != nil {
 			return nil, err
 		}
 	}
@@ -640,15 +790,12 @@ func (a *Adapter) UpdateFilteredPolicies(sec string, ptype string, newPolicies [
 	return oldPolicies, nil
 }
 
-// Close shuts down the adapter.
-// ArangoDB handles connections internally, so this is mostly a no-op.
-// We have it to satisfy the adapter interface.
+// Close is a no-op as the ArangoDB driver manages connections internally.
 func (a *Adapter) Close() error {
 	return nil
 }
 
 // Copy creates a shallow copy of the adapter.
-// Useful for transaction handling where we need separate adapter instances.
 func (a *Adapter) Copy() *Adapter {
 	return &Adapter{
 		client:         a.client,
@@ -662,9 +809,7 @@ func (a *Adapter) Copy() *Adapter {
 }
 
 // Transaction executes a function within a database transaction.
-// This is the old-style transaction interface for backward compatibility.
 func (a *Adapter) Transaction(e casbin.IEnforcer, fc func(casbin.IEnforcer) error) error {
-	// Ensure transaction mutex is initialized
 	if a.transactionMu == nil {
 		a.muInitialize.Do(func() {
 			if a.transactionMu == nil {
@@ -673,16 +818,12 @@ func (a *Adapter) Transaction(e casbin.IEnforcer, fc func(casbin.IEnforcer) erro
 		})
 	}
 
-	// Lock to ensure thread safety
 	a.transactionMu.Lock()
 	defer a.transactionMu.Unlock()
 
-	// Save original adapter
 	originalAdapter := a.Copy()
-
 	ctx := context.Background()
 
-	// Start ArangoDB streaming transaction
 	tx, err := a.db.BeginTransaction(ctx, arangodb.TransactionCollections{
 		Write: []string{a.collectionName},
 	}, nil)
@@ -690,7 +831,6 @@ func (a *Adapter) Transaction(e casbin.IEnforcer, fc func(casbin.IEnforcer) erro
 		return err
 	}
 
-	// Create transaction adapter
 	txAdapter := &Adapter{
 		client:         a.client,
 		db:             a.db,
@@ -699,31 +839,23 @@ func (a *Adapter) Transaction(e casbin.IEnforcer, fc func(casbin.IEnforcer) erro
 		collectionName: a.collectionName,
 		isFiltered:     a.isFiltered,
 		transactionMu:  a.transactionMu,
-		transaction:    tx, // Store transaction
+		transaction:    tx,
 	}
 
-	// Temporarily set transaction adapter
 	e.SetAdapter(txAdapter)
-
-	// Execute transaction function
 	err = fc(e)
-
-	// Restore original adapter
 	e.SetAdapter(originalAdapter)
 
 	if err != nil {
-		// Rollback on error
 		if abortErr := tx.Abort(ctx, nil); abortErr != nil {
 			return abortErr
 		}
-		// Reload policy to sync in-memory model with database
 		if loadErr := e.LoadPolicy(); loadErr != nil {
 			return loadErr
 		}
 		return err
 	}
 
-	// Commit transaction
 	if commitErr := tx.Commit(ctx, nil); commitErr != nil {
 		return commitErr
 	}
@@ -732,9 +864,7 @@ func (a *Adapter) Transaction(e casbin.IEnforcer, fc func(casbin.IEnforcer) erro
 }
 
 // BeginTransaction starts a new database transaction.
-// Returns a context you can use to commit or rollback.
 func (a *Adapter) BeginTransaction(ctx context.Context) (persist.TransactionContext, error) {
-	// Start ArangoDB streaming transaction
 	tx, err := a.db.BeginTransaction(ctx, arangodb.TransactionCollections{
 		Write: []string{a.collectionName},
 	}, nil)
@@ -750,7 +880,7 @@ func (a *Adapter) BeginTransaction(ctx context.Context) (persist.TransactionCont
 	}, nil
 }
 
-// ArangoTransactionContext wraps an ArangoDB transaction for Casbin.
+// ArangoTransactionContext implements persist.TransactionContext for ArangoDB.
 type ArangoTransactionContext struct {
 	tx             arangodb.Transaction
 	ctx            context.Context
@@ -760,7 +890,7 @@ type ArangoTransactionContext struct {
 	rolledBack     bool
 }
 
-// Commit commits the database transaction.
+// Commit commits the transaction.
 func (atx *ArangoTransactionContext) Commit() error {
 	if atx.committed || atx.rolledBack {
 		return errors.New("transaction already finished")
@@ -773,7 +903,7 @@ func (atx *ArangoTransactionContext) Commit() error {
 	return err
 }
 
-// Rollback rolls back the database transaction.
+// Rollback aborts the transaction.
 func (atx *ArangoTransactionContext) Rollback() error {
 	if atx.committed || atx.rolledBack {
 		return errors.New("transaction already finished")
@@ -786,8 +916,7 @@ func (atx *ArangoTransactionContext) Rollback() error {
 	return err
 }
 
-// GetAdapter returns an adapter that uses this transaction.
-// Any policies you add/remove through it will be part of the transaction.
+// GetAdapter returns an adapter bound to this transaction.
 func (atx *ArangoTransactionContext) GetAdapter() persist.Adapter {
 	return &Adapter{
 		client:         atx.adapter.client,
@@ -796,19 +925,16 @@ func (atx *ArangoTransactionContext) GetAdapter() persist.Adapter {
 		databaseName:   atx.adapter.databaseName,
 		collectionName: atx.collectionName,
 		isFiltered:     atx.adapter.isFiltered,
-		transaction:    atx.tx, // Use transaction
+		transaction:    atx.tx,
 	}
 }
 
-// Preview checks which rules are valid for the model.
-// Filters out rules that don't match, so you don't get partial load failures.
+// Preview filters out duplicate rules that already exist in the model.
 func (a *Adapter) Preview(rules *[]CasbinRule, model model.Model) error {
 	j := 0
 	for i, rule := range *rules {
-		// Build policy array
 		r := []string{rule.Ptype, rule.V0, rule.V1, rule.V2, rule.V3, rule.V4, rule.V5}
 
-		// Trim trailing empty fields
 		index := len(r) - 1
 		for r[index] == "" {
 			index--
@@ -818,20 +944,17 @@ func (a *Adapter) Preview(rules *[]CasbinRule, model model.Model) error {
 		key := p[0]
 		sec := key[:1]
 
-		// Check if this policy is valid for the model
 		ok, err := model.HasPolicyEx(sec, key, p[1:])
 		if err != nil {
 			return err
 		}
 
-		// Keep only valid rules
 		if ok {
 			(*rules)[j], (*rules)[i] = rule, (*rules)[j]
 			j++
 		}
 	}
 
-	// Truncate to valid rules only
 	*rules = (*rules)[j:]
 	return nil
 }

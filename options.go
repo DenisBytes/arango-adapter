@@ -1,3 +1,17 @@
+// Copyright 2024 The casbin Authors. All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package arangoadapter
 
 import (
@@ -10,29 +24,29 @@ import (
 	"golang.org/x/net/http2"
 )
 
-// Config holds the configuration for connecting to ArangoDB.
+// Config holds the connection and storage configuration for the adapter.
 type Config struct {
-	Endpoints      []string    // ArangoDB endpoints (e.g., ["http://localhost:8529"])
-	Username       string      // Database username
-	Password       string      // Database password
-	DatabaseName   string      // Name of the database to use
-	CollectionName string      // Name of the collection for Casbin rules
-	TLSEnabled     bool        // Whether to use TLS
-	CACertPath     string      // Path to CA certificate file (for TLS)
-	TLSConfig      *tls.Config // Custom TLS configuration (optional)
+	Endpoints      []string
+	Username       string
+	Password       string
+	DatabaseName   string
+	CollectionName string
+	TLSEnabled     bool
+	CACertPath     string
+	TLSConfig      *tls.Config
 }
 
 // Option is a functional option for configuring the adapter.
 type Option func(*Config)
 
-// WithEndpoints sets the ArangoDB endpoints.
+// WithEndpoints sets the ArangoDB server endpoints.
 func WithEndpoints(endpoints ...string) Option {
 	return func(c *Config) {
 		c.Endpoints = endpoints
 	}
 }
 
-// WithAuthentication sets the username and password.
+// WithAuthentication sets the database credentials.
 func WithAuthentication(username, password string) Option {
 	return func(c *Config) {
 		c.Username = username
@@ -47,14 +61,14 @@ func WithDatabase(name string) Option {
 	}
 }
 
-// WithCollection sets the collection name for Casbin rules.
+// WithCollection sets the collection name.
 func WithCollection(name string) Option {
 	return func(c *Config) {
 		c.CollectionName = name
 	}
 }
 
-// WithTLS enables TLS and optionally sets a CA certificate path.
+// WithTLS enables TLS with an optional CA certificate path.
 func WithTLS(caCertPath string) Option {
 	return func(c *Config) {
 		c.TLSEnabled = true
@@ -62,7 +76,7 @@ func WithTLS(caCertPath string) Option {
 	}
 }
 
-// WithTLSConfig sets a custom TLS configuration.
+// WithTLSConfig enables TLS with a custom tls.Config.
 func WithTLSConfig(tlsConfig *tls.Config) Option {
 	return func(c *Config) {
 		c.TLSEnabled = true
@@ -70,7 +84,7 @@ func WithTLSConfig(tlsConfig *tls.Config) Option {
 	}
 }
 
-// NewConfig creates a default configuration.
+// NewConfig creates a Config with sensible defaults, then applies the given options.
 func NewConfig(opts ...Option) *Config {
 	cfg := &Config{
 		Endpoints:      []string{"http://localhost:8529"},
@@ -78,7 +92,6 @@ func NewConfig(opts ...Option) *Config {
 		Password:       "",
 		DatabaseName:   defaultDatabaseName,
 		CollectionName: defaultCollectionName,
-		TLSEnabled:     false,
 	}
 
 	for _, opt := range opts {
@@ -88,7 +101,6 @@ func NewConfig(opts ...Option) *Config {
 	return cfg
 }
 
-// createConnection builds an ArangoDB connection from the config.
 func (c *Config) createConnection() (arangodb.Client, error) {
 	endpoint := connection.NewRoundRobinEndpoints(c.Endpoints)
 	auth := connection.NewBasicAuth(c.Username, c.Password)
@@ -96,12 +108,10 @@ func (c *Config) createConnection() (arangodb.Client, error) {
 	var conn connection.Connection
 
 	if c.TLSEnabled {
-		// Use custom TLS config if provided, otherwise build from CA cert
 		var tlsConfig *tls.Config
 		if c.TLSConfig != nil {
 			tlsConfig = c.TLSConfig
 		} else if c.CACertPath != "" {
-			// Load CA certificate
 			caCert, err := os.ReadFile(c.CACertPath)
 			if err != nil {
 				return nil, err
@@ -113,13 +123,11 @@ func (c *Config) createConnection() (arangodb.Client, error) {
 				RootCAs:    caCertPool,
 			}
 		} else {
-			// Default TLS config
 			tlsConfig = &tls.Config{
 				MinVersion: tls.VersionTLS12,
 			}
 		}
 
-		// Create HTTP2 transport with TLS
 		transport := &http2.Transport{
 			TLSClientConfig: tlsConfig,
 		}
@@ -131,7 +139,6 @@ func (c *Config) createConnection() (arangodb.Client, error) {
 			ContentType:    "application/json",
 		})
 	} else {
-		// Standard HTTP2 connection without TLS
 		config := connection.DefaultHTTP2ConfigurationWrapper(endpoint, false)
 		config.Authentication = auth
 		conn = connection.NewHttp2Connection(config)

@@ -9,8 +9,6 @@ import (
 	"github.com/casbin/casbin/v2/model"
 )
 
-// Helper function to create a test adapter
-// You'll need a running ArangoDB instance for these tests
 func setupTestAdapter(t *testing.T) *Adapter {
 	adapter, err := NewAdapter(
 		WithEndpoints("http://localhost:8529"),
@@ -25,10 +23,8 @@ func setupTestAdapter(t *testing.T) *Adapter {
 	return adapter
 }
 
-// Clean up test database
 func teardownTestAdapter(t *testing.T, adapter *Adapter) {
 	ctx := context.Background()
-	// Try to get and remove the test database
 	if db, err := adapter.client.Database(ctx, adapter.databaseName); err == nil {
 		_ = db.Remove(ctx)
 	}
@@ -567,38 +563,28 @@ func TestPreview(t *testing.T) {
 	m.AddDef("e", "e", "some(where (p.eft == allow))")
 	m.AddDef("m", "m", "r.sub == p.sub && r.obj == p.obj && r.act == p.act")
 
-	// Create some rules
 	rules := []CasbinRule{
 		{Ptype: "p", V0: "alice", V1: "data1", V2: "read"},
 		{Ptype: "p", V0: "bob", V1: "data2", V2: "write"},
 		{Ptype: "p", V0: "charlie", V1: "data3", V2: "read"},
 	}
 
-	// Add policies to model first
+	// Add alice and bob to the model — Preview should filter them out as duplicates
 	_ = m.AddPolicy("p", "p", []string{"alice", "data1", "read"})
 	_ = m.AddPolicy("p", "p", []string{"bob", "data2", "write"})
 
-	// Preview should keep only rules that exist in model
 	err := adapter.Preview(&rules, m)
 	if err != nil {
 		t.Fatalf("Preview failed: %v", err)
 	}
 
-	// Charlie's rule should be filtered out
-	if len(rules) != 2 {
-		t.Errorf("Expected 2 valid rules, got %d", len(rules))
+	// Only charlie (the non-duplicate) should remain
+	if len(rules) != 1 {
+		t.Errorf("Expected 1 non-duplicate rule, got %d", len(rules))
 	}
 
-	// Verify the remaining rules are alice and bob
-	validNames := map[string]bool{"alice": false, "bob": false}
-	for _, rule := range rules {
-		if _, ok := validNames[rule.V0]; ok {
-			validNames[rule.V0] = true
-		}
-	}
-
-	if !validNames["alice"] || !validNames["bob"] {
-		t.Error("Preview should have kept alice and bob's rules")
+	if len(rules) > 0 && rules[0].V0 != "charlie" {
+		t.Errorf("Expected charlie's rule to remain, got %s", rules[0].V0)
 	}
 }
 
