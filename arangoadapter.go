@@ -269,7 +269,7 @@ func (a *Adapter) LoadFilteredPolicyCtx(ctx context.Context, model model.Model, 
 	case *BatchFilter:
 		filters = f.filters
 	default:
-		return nil
+		return fmt.Errorf("unsupported filter type: %T", filter)
 	}
 
 	if len(filters) == 0 {
@@ -627,6 +627,12 @@ func (a *Adapter) RemoveFilteredPolicyCtx(ctx context.Context, sec string, ptype
 		bindVars["v5"] = fieldValues[5-fieldIndex]
 	}
 
+	// Guard: if no field conditions were added, all fieldValues were empty.
+	// Refuse to delete all rules of a ptype — caller likely has a bug.
+	if !strings.Contains(query, "@v") {
+		return fmt.Errorf("RemoveFilteredPolicy called with no effective field filters; refusing broad deletion")
+	}
+
 	query += " REMOVE doc IN @@collection"
 
 	_, err := a.queryDB(ctx, query, &arangodb.QueryOptions{
@@ -850,10 +856,10 @@ func (a *Adapter) Transaction(e casbin.IEnforcer, fc func(casbin.IEnforcer) erro
 
 	if err != nil {
 		if abortErr := tx.Abort(ctx, nil); abortErr != nil {
-			return abortErr
+			return fmt.Errorf("transaction abort failed: %w (original error: %v)", abortErr, err)
 		}
 		if loadErr := e.LoadPolicy(); loadErr != nil {
-			return loadErr
+			return fmt.Errorf("policy reload failed after rollback: %w (original error: %v)", loadErr, err)
 		}
 		return err
 	}

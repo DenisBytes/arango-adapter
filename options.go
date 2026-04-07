@@ -17,6 +17,7 @@ package arangoadapter
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"fmt"
 	"os"
 
 	"github.com/arangodb/go-driver/v2/arangodb"
@@ -117,7 +118,9 @@ func (c *Config) createConnection() (arangodb.Client, error) {
 				return nil, err
 			}
 			caCertPool := x509.NewCertPool()
-			caCertPool.AppendCertsFromPEM(caCert)
+			if !caCertPool.AppendCertsFromPEM(caCert) {
+				return nil, fmt.Errorf("failed to parse CA certificate from %s", c.CACertPath)
+			}
 			tlsConfig = &tls.Config{
 				MinVersion: tls.VersionTLS12,
 				RootCAs:    caCertPool,
