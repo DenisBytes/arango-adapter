@@ -538,46 +538,14 @@ func (a *Adapter) RemovePoliciesCtx(ctx context.Context, sec string, ptype strin
 	for i, rule := range rules {
 		line := a.savePolicyLine(ptype, rule)
 
-		var fieldConditions []string
-		if line.V0 != "" {
-			key := fmt.Sprintf("r%d_v0", i)
-			fieldConditions = append(fieldConditions, "doc.v0 == @"+key)
-			bindVars[key] = line.V0
+		fields := []string{line.V0, line.V1, line.V2, line.V3, line.V4, line.V5}
+		fieldConditions := make([]string, 6)
+		for f, val := range fields {
+			key := fmt.Sprintf("r%d_v%d", i, f)
+			fieldConditions[f] = fmt.Sprintf("doc.v%d == @%s", f, key)
+			bindVars[key] = val
 		}
-		if line.V1 != "" {
-			key := fmt.Sprintf("r%d_v1", i)
-			fieldConditions = append(fieldConditions, "doc.v1 == @"+key)
-			bindVars[key] = line.V1
-		}
-		if line.V2 != "" {
-			key := fmt.Sprintf("r%d_v2", i)
-			fieldConditions = append(fieldConditions, "doc.v2 == @"+key)
-			bindVars[key] = line.V2
-		}
-		if line.V3 != "" {
-			key := fmt.Sprintf("r%d_v3", i)
-			fieldConditions = append(fieldConditions, "doc.v3 == @"+key)
-			bindVars[key] = line.V3
-		}
-		if line.V4 != "" {
-			key := fmt.Sprintf("r%d_v4", i)
-			fieldConditions = append(fieldConditions, "doc.v4 == @"+key)
-			bindVars[key] = line.V4
-		}
-		if line.V5 != "" {
-			key := fmt.Sprintf("r%d_v5", i)
-			fieldConditions = append(fieldConditions, "doc.v5 == @"+key)
-			bindVars[key] = line.V5
-		}
-
-		if len(fieldConditions) > 0 {
-			ruleConditions = append(ruleConditions, "("+strings.Join(fieldConditions, " && ")+")")
-		}
-	}
-
-	// No field conditions means all fields were empty; return early to avoid an overly broad deletion.
-	if len(ruleConditions) == 0 {
-		return nil
+		ruleConditions = append(ruleConditions, "("+strings.Join(fieldConditions, " && ")+")")
 	}
 
 	query += strings.Join(ruleConditions, " OR ")
@@ -725,9 +693,6 @@ func (a *Adapter) UpdateFilteredPolicies(sec string, ptype string, newPolicies [
 // UpdateFilteredPoliciesCtx atomically removes rules matching the filter
 // and inserts newPolicies. Returns the old rules that were removed.
 func (a *Adapter) UpdateFilteredPoliciesCtx(ctx context.Context, sec string, ptype string, newPolicies [][]string, fieldIndex int, fieldValues ...string) ([][]string, error) {
-	// Load existing policies that match the filter before removing them
-	oldPolicies := make([][]string, 0)
-
 	query := "FOR doc IN @@collection FILTER doc.ptype == @ptype"
 	bindVars := map[string]interface{}{
 		"@collection": a.collectionName,
@@ -759,14 +724,17 @@ func (a *Adapter) UpdateFilteredPoliciesCtx(ctx context.Context, sec string, pty
 		bindVars["v5"] = fieldValues[5-fieldIndex]
 	}
 
-	// First, collect old policies that will be removed
-	selectQuery := query + " RETURN doc"
-	cursor, err := a.queryDB(ctx, selectQuery, &arangodb.QueryOptions{
+	// Single-pass: remove matching docs and return the old values
+	query += " REMOVE doc IN @@collection RETURN OLD"
+
+	cursor, err := a.queryDB(ctx, query, &arangodb.QueryOptions{
 		BindVars: bindVars,
 	})
 	if err != nil {
 		return nil, err
 	}
+
+	oldPolicies := make([][]string, 0)
 	for cursor.HasMore() {
 		var rule CasbinRule
 		_, err := cursor.ReadDocument(ctx, &rule)
@@ -775,7 +743,6 @@ func (a *Adapter) UpdateFilteredPoliciesCtx(ctx context.Context, sec string, pty
 			return nil, err
 		}
 		policy := []string{rule.V0, rule.V1, rule.V2, rule.V3, rule.V4, rule.V5}
-		// Trim trailing empty fields
 		i := len(policy) - 1
 		for i >= 0 && policy[i] == "" {
 			i--
@@ -784,18 +751,9 @@ func (a *Adapter) UpdateFilteredPoliciesCtx(ctx context.Context, sec string, pty
 	}
 	_ = cursor.Close()
 
-	// Remove old policies matching the filter
-	removeQuery := query + " REMOVE doc IN @@collection"
-	_, err = a.queryDB(ctx, removeQuery, &arangodb.QueryOptions{
-		BindVars: bindVars,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	// Add new policies
-	for _, newPolicy := range newPolicies {
-		if err := a.AddPolicyCtx(ctx, sec, ptype, newPolicy); err != nil {
+	// Add new policies in batch
+	if len(newPolicies) > 0 {
+		if err := a.AddPoliciesCtx(ctx, sec, ptype, newPolicies); err != nil {
 			return nil, err
 		}
 	}
