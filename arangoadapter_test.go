@@ -618,3 +618,185 @@ func TestNewFilteredAdapter(t *testing.T) {
 		t.Error("NewFilteredAdapter should create filtered adapter")
 	}
 }
+
+func TestRemovePolicies(t *testing.T) {
+	adapter := setupTestAdapter(t)
+	defer teardownTestAdapter(t, adapter)
+
+	rules := [][]string{
+		{"alice", "data1", "read"},
+		{"bob", "data2", "write"},
+		{"charlie", "data3", "read"},
+	}
+	err := adapter.AddPolicies("p", "p", rules)
+	if err != nil {
+		t.Fatalf("Failed to add policies: %v", err)
+	}
+
+	// Batch-remove alice and charlie
+	err = adapter.RemovePolicies("p", "p", [][]string{
+		{"alice", "data1", "read"},
+		{"charlie", "data3", "read"},
+	})
+	if err != nil {
+		t.Fatalf("Failed to remove policies: %v", err)
+	}
+
+	m := model.NewModel()
+	m.AddDef("r", "r", "sub, obj, act")
+	m.AddDef("p", "p", "sub, obj, act")
+	m.AddDef("e", "e", "some(where (p.eft == allow))")
+	m.AddDef("m", "m", "r.sub == p.sub && r.obj == p.obj && r.act == p.act")
+
+	_ = adapter.LoadPolicy(m)
+	policies, _ := m.GetPolicy("p", "p")
+	if len(policies) != 1 {
+		t.Fatalf("Expected 1 policy, got %d", len(policies))
+	}
+	if policies[0][0] != "bob" {
+		t.Errorf("Expected bob's policy to remain, got %v", policies[0])
+	}
+
+	// Empty rules should be a no-op
+	err = adapter.RemovePolicies("p", "p", [][]string{})
+	if err != nil {
+		t.Errorf("Empty RemovePolicies should not error: %v", err)
+	}
+}
+
+func TestUpdatePolicies(t *testing.T) {
+	adapter := setupTestAdapter(t)
+	defer teardownTestAdapter(t, adapter)
+
+	rules := [][]string{
+		{"alice", "data1", "read"},
+		{"bob", "data2", "write"},
+	}
+	_ = adapter.AddPolicies("p", "p", rules)
+
+	err := adapter.UpdatePolicies("p", "p",
+		[][]string{{"alice", "data1", "read"}, {"bob", "data2", "write"}},
+		[][]string{{"alice", "data1", "write"}, {"bob", "data2", "read"}},
+	)
+	if err != nil {
+		t.Fatalf("Failed to update policies: %v", err)
+	}
+
+	m := model.NewModel()
+	m.AddDef("r", "r", "sub, obj, act")
+	m.AddDef("p", "p", "sub, obj, act")
+	m.AddDef("e", "e", "some(where (p.eft == allow))")
+	m.AddDef("m", "m", "r.sub == p.sub && r.obj == p.obj && r.act == p.act")
+	_ = adapter.LoadPolicy(m)
+
+	policies, _ := m.GetPolicy("p", "p")
+	if len(policies) != 2 {
+		t.Fatalf("Expected 2 policies, got %d", len(policies))
+	}
+
+	// Test mismatched lengths
+	err = adapter.UpdatePolicies("p", "p",
+		[][]string{{"alice", "data1", "write"}},
+		[][]string{{"a", "b", "c"}, {"d", "e", "f"}},
+	)
+	if err == nil {
+		t.Error("Expected error for mismatched old/new rule lengths")
+	}
+}
+
+func TestUpdateFilteredPolicies(t *testing.T) {
+	adapter := setupTestAdapter(t)
+	defer teardownTestAdapter(t, adapter)
+
+	rules := [][]string{
+		{"alice", "data1", "read"},
+		{"alice", "data2", "write"},
+		{"bob", "data1", "read"},
+	}
+	_ = adapter.AddPolicies("p", "p", rules)
+
+	// Replace alice's rules with new ones
+	oldPolicies, err := adapter.UpdateFilteredPolicies("p", "p",
+		[][]string{{"alice", "data3", "execute"}},
+		0, "alice",
+	)
+	if err != nil {
+		t.Fatalf("Failed to update filtered policies: %v", err)
+	}
+
+	if len(oldPolicies) != 2 {
+		t.Errorf("Expected 2 old policies returned, got %d", len(oldPolicies))
+	}
+
+	m := model.NewModel()
+	m.AddDef("r", "r", "sub, obj, act")
+	m.AddDef("p", "p", "sub, obj, act")
+	m.AddDef("e", "e", "some(where (p.eft == allow))")
+	m.AddDef("m", "m", "r.sub == p.sub && r.obj == p.obj && r.act == p.act")
+	_ = adapter.LoadPolicy(m)
+
+	policies, _ := m.GetPolicy("p", "p")
+	if len(policies) != 2 {
+		t.Fatalf("Expected 2 policies, got %d", len(policies))
+	}
+}
+
+func TestRemoveFilteredPolicyFieldIndex(t *testing.T) {
+	adapter := setupTestAdapter(t)
+	defer teardownTestAdapter(t, adapter)
+
+	rules := [][]string{
+		{"alice", "data1", "read"},
+		{"bob", "data1", "write"},
+		{"charlie", "data2", "read"},
+	}
+	_ = adapter.AddPolicies("p", "p", rules)
+
+	// Remove by fieldIndex=1 (v1="data1")
+	err := adapter.RemoveFilteredPolicy("p", "p", 1, "data1")
+	if err != nil {
+		t.Fatalf("Failed: %v", err)
+	}
+
+	m := model.NewModel()
+	m.AddDef("r", "r", "sub, obj, act")
+	m.AddDef("p", "p", "sub, obj, act")
+	m.AddDef("e", "e", "some(where (p.eft == allow))")
+	m.AddDef("m", "m", "r.sub == p.sub && r.obj == p.obj && r.act == p.act")
+	_ = adapter.LoadPolicy(m)
+
+	policies, _ := m.GetPolicy("p", "p")
+	if len(policies) != 1 {
+		t.Fatalf("Expected 1 policy remaining, got %d", len(policies))
+	}
+	if policies[0][0] != "charlie" {
+		t.Errorf("Expected charlie's policy, got %v", policies[0])
+	}
+}
+
+func TestLoadFilteredPolicyUnknownType(t *testing.T) {
+	adapter := setupTestAdapter(t)
+	defer teardownTestAdapter(t, adapter)
+
+	m := model.NewModel()
+	m.AddDef("r", "r", "sub, obj, act")
+	m.AddDef("p", "p", "sub, obj, act")
+	m.AddDef("e", "e", "some(where (p.eft == allow))")
+	m.AddDef("m", "m", "r.sub == p.sub && r.obj == p.obj && r.act == p.act")
+
+	// Passing an unsupported type should return an error
+	err := adapter.LoadFilteredPolicy(m, "invalid-filter")
+	if err == nil {
+		t.Error("Expected error for unsupported filter type")
+	}
+}
+
+func TestNewBatchFilter(t *testing.T) {
+	f1 := Filter{V0: []string{"alice"}}
+	f2 := Filter{V0: []string{"bob"}}
+	bf := NewBatchFilter(f1, f2)
+
+	if len(bf.filters) != 2 {
+		t.Errorf("Expected 2 filters, got %d", len(bf.filters))
+	}
+}
