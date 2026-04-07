@@ -62,7 +62,13 @@ type BatchFilter struct {
 	filters []Filter
 }
 
-// Adapter represents the ArangoDB adapter for policy storage.
+// NewBatchFilter creates a BatchFilter from one or more Filter values.
+func NewBatchFilter(filters ...Filter) *BatchFilter {
+	return &BatchFilter{filters: filters}
+}
+
+// Adapter implements the Casbin persist.Adapter interface for ArangoDB.
+// It supports filtered policies, batch operations, and streaming transactions.
 type Adapter struct {
 	client         arangodb.Client
 	db             arangodb.Database
@@ -72,11 +78,10 @@ type Adapter struct {
 	isFiltered     bool
 	transaction    arangodb.Transaction
 	transactionMu  *sync.Mutex
-	muInitialize   sync.Once
 }
 
-// NewAdapter is the constructor for Adapter.
-// It creates the database and collection if they don't already exist.
+// NewAdapter creates a new Adapter for ArangoDB and ensures the
+// target database and collection exist, creating them if necessary.
 //
 // Example:
 //
@@ -111,7 +116,7 @@ func NewAdapter(opts ...Option) (*Adapter, error) {
 	return a, nil
 }
 
-// NewFilteredAdapter is the constructor for FilteredAdapter.
+// NewFilteredAdapter creates an Adapter with filtered policy loading enabled.
 // Casbin will not automatically call LoadPolicy() for a filtered adapter.
 func NewFilteredAdapter(opts ...Option) (*Adapter, error) {
 	adapter, err := NewAdapter(opts...)
@@ -349,7 +354,8 @@ func (a *Adapter) SavePolicy(model model.Model) error {
 	return a.SavePolicyCtx(context.Background(), model)
 }
 
-// SavePolicyCtx saves all policy rules to the database with context support.
+// SavePolicyCtx clears the collection and writes every rule from the model.
+// WARNING: this truncates the collection before writing.
 func (a *Adapter) SavePolicyCtx(ctx context.Context, model model.Model) error {
 	const batchSize = 1000
 
@@ -634,7 +640,7 @@ func (a *Adapter) UpdatePolicy(sec string, ptype string, oldRule, newPolicy []st
 	return a.UpdatePolicyCtx(context.Background(), sec, ptype, oldRule, newPolicy)
 }
 
-// UpdatePolicyCtx updates a policy rule from the storage with context support.
+// UpdatePolicyCtx replaces the first rule matching oldRule with newPolicy.
 func (a *Adapter) UpdatePolicyCtx(ctx context.Context, sec string, ptype string, oldRule, newPolicy []string) error {
 	oldLine := a.savePolicyLine(ptype, oldRule)
 	newLine := a.savePolicyLine(ptype, newPolicy)
@@ -710,7 +716,8 @@ func (a *Adapter) UpdateFilteredPolicies(sec string, ptype string, newPolicies [
 	return a.UpdateFilteredPoliciesCtx(context.Background(), sec, ptype, newPolicies, fieldIndex, fieldValues...)
 }
 
-// UpdateFilteredPoliciesCtx deletes old rules matching the filter and adds new ones, with context support.
+// UpdateFilteredPoliciesCtx atomically removes rules matching the filter
+// and inserts newPolicies. Returns the old rules that were removed.
 func (a *Adapter) UpdateFilteredPoliciesCtx(ctx context.Context, sec string, ptype string, newPolicies [][]string, fieldIndex int, fieldValues ...string) ([][]string, error) {
 	// Load existing policies that match the filter before removing them
 	oldPolicies := make([][]string, 0)
@@ -808,16 +815,11 @@ func (a *Adapter) Copy() *Adapter {
 	}
 }
 
-// Transaction executes a function within a database transaction.
+// Transaction executes fc within a streaming ArangoDB transaction.
+// On success it commits; on error it aborts and reloads the model.
+// The enforcer's adapter is swapped to a transaction-bound copy for the
+// duration of fc and restored afterward regardless of outcome.
 func (a *Adapter) Transaction(e casbin.IEnforcer, fc func(casbin.IEnforcer) error) error {
-	if a.transactionMu == nil {
-		a.muInitialize.Do(func() {
-			if a.transactionMu == nil {
-				a.transactionMu = &sync.Mutex{}
-			}
-		})
-	}
-
 	a.transactionMu.Lock()
 	defer a.transactionMu.Unlock()
 
@@ -926,10 +928,12 @@ func (atx *ArangoTransactionContext) GetAdapter() persist.Adapter {
 		collectionName: atx.collectionName,
 		isFiltered:     atx.adapter.isFiltered,
 		transaction:    atx.tx,
+		transactionMu:  atx.adapter.transactionMu,
 	}
 }
 
-// Preview filters out duplicate rules that already exist in the model.
+// Preview removes rules from the slice that already exist in the model,
+// leaving only rules that would be new additions.
 func (a *Adapter) Preview(rules *[]CasbinRule, model model.Model) error {
 	j := 0
 	for i, rule := range *rules {
